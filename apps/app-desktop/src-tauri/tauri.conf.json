@@ -1,0 +1,25 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Deskflow-Plus",
+  "version": "0.1.0",
+  "identifier": "org.deskflow.plus",
+  "build": {
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Deskflow-Plus",
+        "width": 1200,
+        "height": 800,
+        "resizable": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all"
+  }
+}
