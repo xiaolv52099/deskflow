@@ -2,10 +2,7 @@
 
 use anyhow::{Context as AnyhowContext, Result};
 use core_clipboard::{ClipboardSyncEngine, ImageClipboardFormat};
-use core_file_transfer::{
-    approve_transfer, chunk_manifest_files, plan_transfer, transfer_pipeline_latency,
-    TransferFileDescriptor, TransferPlan, TransferProgress, TransferReceiver,
-};
+use core_file_transfer::{approve_transfer, plan_transfer, TransferFileDescriptor, TransferPlan, TransferProgress};
 use core_input::{
     current_platform_input_status, sample_cursor_position, InputTuningProfile, PlatformInputStatus,
 };
@@ -14,7 +11,7 @@ use core_service::run_core_service;
 use core_session::{
     apply_device_repair, managed_devices_from_trust_store, schedule_device_reconnect,
     build_client_tls_config, manual_endpoint, process_pairing_request, session_descriptor, DeviceRepairAction,
-    ManagedDevice, PairingDecision, PairingRequest, DISCOVERY_PORT, SESSION_PORT,
+    ManagedDevice, ManagedDeviceStatus, PairingDecision, PairingRequest, DISCOVERY_PORT, SESSION_PORT,
     DEFAULT_OFFLINE_AFTER_MS,
 };
 use core_topology::{apply_hot_update, load_or_create_topology, save_topology, GridPosition, TopologyLayout};
@@ -31,7 +28,6 @@ use foundation::{
 use local_ipc::{send_command, CoreToUiEvent, UiToCoreCommand};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::collections::HashMap;
 use std::fs;
 use std::sync::{Arc, Mutex};
 use tauri::menu::{MenuBuilder, MenuEvent, MenuItem};
@@ -249,7 +245,6 @@ struct TransferPlanRequest {
 #[serde(rename_all = "snake_case")]
 struct TransferFileRequest {
     name: String,
-    size_bytes: u64,
     bytes: Vec<u8>,
 }
 
@@ -787,14 +782,30 @@ fn get_connection_state(state: tauri::State<'_, AppState>) -> Result<ConnectionS
             .map_err(|_| "failed to access managed devices".to_string())?;
         *managed_slot = managed.clone();
     }
+    let now = unix_time_now_ms();
     let active_peer_state = if let Some(device_id) = config.active_peer_device_id.as_ref() {
-        if managed
-            .iter()
-            .any(|device| device.device_id.to_string() == *device_id)
-        {
+        let trusted_match = trust_store
+            .trusted_device(Uuid::parse_str(device_id).map_err(|error: uuid::Error| error.to_string())?);
+        let managed_match = managed.iter().find(|device| device.device_id.to_string() == *device_id);
+        let discovery_match = discovery_peers.iter().find(|peer| peer.device_id == *device_id);
+        let controller_peer_online = discovery_match.is_some_and(|peer| {
+            now.saturating_sub(peer.discovered_at_unix_ms) <= DISCOVERY_PEER_TTL_MS
+        });
+        let managed_peer_online = managed_match.is_some_and(|device| device.status == ManagedDeviceStatus::Online);
+        if config.app_role == "client" {
+            if trusted_match.is_some() && controller_peer_online {
+                "connected"
+            } else if trusted_match.is_none() {
+                "pending"
+            } else {
+                "disconnected"
+            }
+        } else if config.controller_service_enabled && managed_peer_online {
             "connected"
+        } else if config.controller_service_enabled {
+            "disconnected"
         } else {
-            "pending"
+            "disconnected"
         }
     } else {
         "disconnected"
@@ -902,12 +913,6 @@ fn set_controller_service_enabled(
             config.active_peer_device_id = None;
             config.last_pairing_error = None;
         }
-        if enabled && config.active_peer_device_id.is_none() {
-            let devices = load_trust_store(&state.data_paths).map_err(|error| error.to_string())?;
-            if let Some(device) = devices.devices.into_iter().find(|device| device.revoked_at_unix_ms.is_none()) {
-                config.active_peer_device_id = Some(device.device_id.to_string());
-            }
-        }
         save_config(&state.data_paths, &config).map_err(|error| error.to_string())?;
     }
     if !enabled {
@@ -931,14 +936,7 @@ fn set_controller_service_enabled(
             .map_err(|_| "failed to access app health".to_string())?;
         health.app_role = "controller".into();
         health.controller_service_enabled = enabled;
-        if enabled {
-            if health.active_peer_device_id.is_none() {
-                let devices = load_trust_store(&state.data_paths).map_err(|error| error.to_string())?;
-                if let Some(device) = devices.devices.into_iter().find(|device| device.revoked_at_unix_ms.is_none()) {
-                    health.active_peer_device_id = Some(device.device_id.to_string());
-                }
-            }
-        } else {
+        if !enabled {
             health.active_peer_device_id = None;
         }
     }
@@ -1635,10 +1633,25 @@ fn create_transfer_plan(
         .trusted_device(target_device_id)
         .cloned()
         .ok_or_else(|| "target device is not trusted".to_string())?;
+    let managed_devices = managed_devices_from_trust_store(
+        &trust_store,
+        unix_time_now_ms(),
+        DEFAULT_OFFLINE_AFTER_MS,
+    );
+    let target_online = managed_devices
+        .iter()
+        .find(|device| device.device_id == target_device_id)
+        .is_some_and(|device| device.status == ManagedDeviceStatus::Online);
+    if !target_online {
+        return Err("target device is currently offline".to_string());
+    }
+
+    let now = unix_time_now_ms();
     let discovery_peers = load_discovery_peers(&state.data_paths).map_err(|error| error.to_string())?;
     let cached_peers = load_cached_peer_descriptors(&state.data_paths).map_err(|error| error.to_string())?;
     let remote = discovery_peers
         .iter()
+        .filter(|peer| now.saturating_sub(peer.discovered_at_unix_ms) <= DISCOVERY_PEER_TTL_MS)
         .find(|peer| peer.device_id == trusted_target.device_id.to_string())
         .map(discovery_peer_to_descriptor)
         .or_else(|| {
@@ -1655,22 +1668,33 @@ fn create_transfer_plan(
             .map_err(|_| "failed to access clipboard state".to_string())?;
         clipboard.local_device_id()
     };
-    let request_files = request.files;
-    let file_bytes = request_files.iter().map(|file| file.bytes.clone()).collect::<Vec<_>>();
-    let files = request_files
+    let outbound_files = request
+        .files
         .into_iter()
+        .map(|file| TransferArtifactFile {
+            name: file.name,
+            bytes: file.bytes,
+        })
+        .collect::<Vec<_>>();
+    let files = outbound_files
+        .iter()
         .map(|file| TransferFileDescriptor {
             file_id: Uuid::new_v4(),
-            name: file.name,
-            size_bytes: file.size_bytes,
+            name: file.name.clone(),
+            size_bytes: file.bytes.len() as u64,
         })
         .collect();
+    let file_bytes = outbound_files
+        .iter()
+        .map(|file| file.bytes.clone())
+        .collect::<Vec<_>>();
     let plan = approve_transfer(
         plan_transfer(source_device_id, target_device_id, files, None)
             .map_err(|error| error.to_string())?,
     );
     let record = execute_remote_transfer(&state.data_paths, &remote, plan, file_bytes).map_err(|error| error.to_string())?;
-    persist_transfer_artifacts(&state.data_paths, &record).map_err(|error| error.to_string())?;
+    persist_outbound_transfer_artifacts(&state.data_paths, &record, &outbound_files)
+        .map_err(|error| error.to_string())?;
     state
         .transfer_records
         .lock()
@@ -1679,7 +1703,11 @@ fn create_transfer_plan(
     Ok(record)
 }
 
-fn persist_transfer_artifacts(paths: &AppPaths, record: &TransferRecord) -> Result<()> {
+fn persist_outbound_transfer_artifacts(
+    paths: &AppPaths,
+    record: &TransferRecord,
+    files: &[TransferArtifactFile],
+) -> Result<()> {
     paths.ensure_layout()?;
     let transfer_dir = paths
         .transfers_dir()
@@ -1690,15 +1718,10 @@ fn persist_transfer_artifacts(paths: &AppPaths, record: &TransferRecord) -> Resu
     let summary = serde_json::to_string_pretty(record).context("serialize transfer record")?;
     fs::write(&summary_path, summary).context("write transfer record summary")?;
 
-    for descriptor in &record.plan.manifest.files {
-        let file_path = transfer_dir.join(&descriptor.name);
-        let bytes = deterministic_transfer_bytes(descriptor.file_id, descriptor.size_bytes)?;
-        fs::write(file_path, bytes).with_context(|| {
-            format!(
-                "write generated transfer payload for {}",
-                descriptor.name
-            )
-        })?;
+    for file in files {
+        let file_path = transfer_dir.join(&file.name);
+        fs::write(&file_path, &file.bytes)
+            .with_context(|| format!("write outbound transfer artifact {}", file_path.display()))?;
     }
 
     Ok(())
@@ -1900,48 +1923,6 @@ fn export_diagnostics(state: tauri::State<'_, AppState>) -> Result<DiagnosticExp
     })
 }
 
-fn execute_memory_transfer(plan: TransferPlan) -> Result<TransferRecord> {
-    let (completed, elapsed) = transfer_pipeline_latency(|| {
-        let mut file_bytes = HashMap::new();
-        for descriptor in &plan.manifest.files {
-            file_bytes.insert(
-                descriptor.file_id,
-                deterministic_transfer_bytes(descriptor.file_id, descriptor.size_bytes)?,
-            );
-        }
-        let chunks = chunk_manifest_files(&plan, &file_bytes)?;
-        let mut receiver = TransferReceiver::new(plan.clone())?;
-        let mut progress = receiver.progress(0);
-        for chunk in chunks {
-            progress = receiver.accept_chunk(chunk)?;
-        }
-        let completed = receiver.complete()?;
-        anyhow::ensure!(
-            completed
-                .files
-                .iter()
-                .all(|file| file.bytes.len() as u64 == file.descriptor.size_bytes),
-            "completed transfer failed size verification"
-        );
-        Ok::<_, anyhow::Error>((completed, progress))
-    })?;
-
-    Ok(TransferRecord {
-        plan,
-        progress: completed.1,
-        verified_files: completed.0.files.len(),
-        elapsed_ms: elapsed.as_millis(),
-        created_at_unix_ms: unix_time_now_ms(),
-        direction: default_transfer_direction(),
-        peer_device_id: None,
-        peer_display_name: None,
-        delivery_state: default_delivery_state(),
-        delivery_message: None,
-        confirmed_at_unix_ms: None,
-        error: None,
-    })
-}
-
 fn execute_remote_transfer(
     paths: &AppPaths,
     remote: &DeviceDescriptor,
@@ -1949,11 +1930,28 @@ fn execute_remote_transfer(
     file_bytes: Vec<Vec<u8>>,
 ) -> Result<TransferRecord> {
     let local_identity = load_or_create_identity(paths, &default_display_name())?;
-    let mut record = execute_memory_transfer(plan.clone())?;
-    record.direction = "outbound".into();
-    record.peer_device_id = Some(remote.device_id.clone());
-    record.peer_display_name = Some(remote.display_name.clone());
-    record.delivery_state = "sending".into();
+    let started = std::time::Instant::now();
+    let mut record = TransferRecord {
+        progress: TransferProgress {
+            transfer_id: plan.manifest.transfer_id,
+            transferred_bytes: 0,
+            total_bytes: plan.manifest.total_bytes,
+            chunk_index: 0,
+            total_chunks: plan.total_chunks,
+            status: core_file_transfer::TransferStatus::InProgress,
+        },
+        plan: plan.clone(),
+        verified_files: 0,
+        elapsed_ms: 0,
+        created_at_unix_ms: unix_time_now_ms(),
+        direction: "outbound".into(),
+        peer_device_id: Some(remote.device_id.clone()),
+        peer_display_name: Some(remote.display_name.clone()),
+        delivery_state: "sending".into(),
+        delivery_message: None,
+        confirmed_at_unix_ms: None,
+        error: None,
+    };
     let payload = TransferArtifactPayload {
         record: record.clone(),
         source_device_id: local_identity.device_id.to_string(),
@@ -1973,7 +1971,7 @@ fn execute_remote_transfer(
     let client_config = std::sync::Arc::new(build_client_tls_config(paths, remote)?);
     let stream = std::net::TcpStream::connect((remote.address.as_str(), remote.port))
         .with_context(|| format!("connect remote transfer session {}:{}", remote.address, remote.port))?;
-    let server_name = rustls::pki_types::ServerName::try_from(remote.display_name.clone())
+    let server_name = rustls::pki_types::ServerName::try_from(remote.device_id.clone())
         .map_err(|_| anyhow::anyhow!("invalid remote server name"))?;
     let connection = rustls::ClientConnection::new(client_config, server_name)
         .context("create transfer client tls connection")?;
@@ -1989,6 +1987,7 @@ fn execute_remote_transfer(
     let mut ack_bytes = vec![0u8; ack_len as usize];
     tls.read_exact(&mut ack_bytes).context("read transfer ack payload")?;
     let ack: TransferDeliveryAck = serde_json::from_slice(&ack_bytes).context("parse transfer ack payload")?;
+    record.elapsed_ms = started.elapsed().as_millis();
     if !ack.ok {
         record.delivery_state = "failed".into();
         record.delivery_message = Some(ack.message);
@@ -2003,6 +2002,7 @@ fn execute_remote_transfer(
     record.verified_files = ack.verified_files;
     record.progress.transferred_bytes = ack.total_bytes;
     record.progress.total_bytes = ack.total_bytes;
+    record.progress.chunk_index = record.progress.total_chunks.saturating_sub(1);
     record.progress.status = core_file_transfer::TransferStatus::Completed;
 
     Ok(record)
@@ -2083,15 +2083,6 @@ fn reveal_path_in_system(path: &std::path::Path) -> Result<()> {
             .context("open transfer artifact directory")?;
         return Ok(());
     }
-}
-
-fn deterministic_transfer_bytes(file_id: Uuid, size_bytes: u64) -> Result<Vec<u8>> {
-    let size = usize::try_from(size_bytes)
-        .map_err(|_| anyhow::anyhow!("file {file_id} exceeds platform capacity"))?;
-    let seed = file_id.as_bytes();
-    Ok((0..size)
-        .map(|index| seed[index % seed.len()] ^ ((index % 251) as u8))
-        .collect())
 }
 
 fn deterministic_bgra_image(width: u32, height: u32) -> Result<Vec<u8>> {

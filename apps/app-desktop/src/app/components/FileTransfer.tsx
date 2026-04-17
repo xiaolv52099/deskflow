@@ -151,6 +151,10 @@ export function FileTransfer() {
 
   useEffect(() => {
     void refresh().catch((nextError) => setError(formatError(nextError)));
+    const timer = window.setInterval(() => {
+      void refresh().catch(() => undefined);
+    }, 2500);
+    return () => window.clearInterval(timer);
   }, []);
 
   const rows = useMemo(() => flattenRows(records), [records]);

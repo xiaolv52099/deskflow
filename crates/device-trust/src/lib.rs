@@ -191,6 +191,19 @@ pub fn revoke_trusted_device(paths: &AppPaths, device_id: Uuid) -> Result<()> {
     save_trust_store(paths, &trust_store)
 }
 
+pub fn update_trusted_device_last_seen(paths: &AppPaths, device_id: Uuid, seen_at_unix_ms: u128) -> Result<bool> {
+    let mut trust_store = load_trust_store(paths)?;
+    let Some(device) = trust_store
+        .devices
+        .iter_mut()
+        .find(|device| device.device_id == device_id && device.revoked_at_unix_ms.is_none()) else {
+        return Ok(false);
+    };
+    device.last_seen_unix_ms = Some(seen_at_unix_ms);
+    save_trust_store(paths, &trust_store)?;
+    Ok(true)
+}
+
 pub fn validate_trust(
     paths: &AppPaths,
     identity: &DeviceIdentity,

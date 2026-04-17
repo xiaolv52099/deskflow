@@ -6,7 +6,7 @@ use core_session::{
     session_descriptor, PairingDecision, PairingRequest, DISCOVERY_PORT, SESSION_PORT,
 };
 use core_topology::load_or_create_topology;
-use device_trust::{default_display_name, load_or_create_certificate, load_or_create_identity};
+use device_trust::{default_display_name, load_or_create_certificate, load_or_create_identity, update_trusted_device_last_seen};
 use foundation::{
     append_log, export_diagnostic_snapshot, init_tracing, load_discovery_peers, load_or_create_config,
     load_pending_pairing_requests, save_discovery_peers, save_pending_pairing_requests, upsert_cached_peer_descriptor,
@@ -24,6 +24,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::watch;
 use tracing::info;
+use uuid::Uuid;
 
 const DISCOVERY_PEER_TTL_MS: u128 = 8_000;
 
@@ -229,6 +230,9 @@ async fn run_discovery_loop(
                         if remote.device_id == device.device_id {
                             continue;
                         }
+                        if let Ok(remote_device_id) = Uuid::parse_str(&remote.device_id) {
+                            let _ = update_trusted_device_last_seen(&paths, remote_device_id, unix_time_now_ms());
+                        }
                         if let Ok(config) = load_or_create_config(&paths) {
                             if config.app_role == "controller" && config.controller_service_enabled {
                                 let _ = socket.send_to(&announce, &addr).await;
@@ -238,6 +242,9 @@ async fn run_discovery_loop(
                     ProtocolMessage::DiscoverAnnounce(remote) => {
                         if remote.device_id == device.device_id {
                             continue;
+                        }
+                        if let Ok(remote_device_id) = Uuid::parse_str(&remote.device_id) {
+                            let _ = update_trusted_device_last_seen(&paths, remote_device_id, unix_time_now_ms());
                         }
                         peers.insert(
                             remote.device_id.clone(),
@@ -315,6 +322,9 @@ async fn run_discovery_loop(
                             config.active_peer_device_id = Some(peer.device_id);
                             config.last_pairing_error = None;
                             foundation::save_config(&paths, &config)?;
+                            if let Ok(remote_device_id) = Uuid::parse_str(&device_id) {
+                                let _ = update_trusted_device_last_seen(&paths, remote_device_id, unix_time_now_ms());
+                            }
                         }
                     }
                     ProtocolMessage::PairReject { reason, .. } => {
