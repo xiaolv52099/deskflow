@@ -99,6 +99,13 @@ function GridCell({
 }
 
 function clientCard(state: ConnectionStateDto | null) {
+  if (state?.last_pairing_error) {
+    return {
+      title: "连接请求被拒绝",
+      detail: state.last_pairing_error,
+      className: "border-rose-500/20 bg-rose-500/10 text-rose-300",
+    };
+  }
   if (state?.active_peer_state === "connected" && state.active_peer_display_name) {
     return {
       title: "已连接主控端",
@@ -167,6 +174,8 @@ export function ConnectionConfig() {
     if (error) return;
     if (nextState.controller_service_enabled) {
       setStatusText(`主控端服务已启用，正在监听 ${nextProfile.lan_ip}:${nextProfile.session_port}`);
+    } else if (nextState.last_pairing_error) {
+      setStatusText(nextState.last_pairing_error);
     } else if (nextState.active_peer_state === "connected" && nextState.active_peer_display_name) {
       setStatusText(`当前已连接主控端：${nextState.active_peer_display_name}`);
     } else if (nextState.active_peer_state === "pending") {

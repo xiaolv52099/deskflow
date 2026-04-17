@@ -52,6 +52,8 @@ pub struct AppConfig {
     pub current_pairing_code: Option<String>,
     #[serde(default)]
     pub active_peer_device_id: Option<String>,
+    #[serde(default)]
+    pub last_pairing_error: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -65,6 +67,7 @@ impl Default for AppConfig {
             controller_service_enabled: false,
             current_pairing_code: None,
             active_peer_device_id: None,
+            last_pairing_error: None,
         }
     }
 }

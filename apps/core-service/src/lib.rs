@@ -233,13 +233,19 @@ async fn run_discovery_loop(
                             let mut config = load_or_create_config(&paths)?;
                             config.app_role = "client".into();
                             config.active_peer_device_id = Some(peer.device_id);
+                            config.last_pairing_error = None;
                             foundation::save_config(&paths, &config)?;
                         }
                     }
-                    ProtocolMessage::PairReject { device_id, .. } => {
+                    ProtocolMessage::PairReject { reason, .. } => {
                         let mut config = load_or_create_config(&paths)?;
-                        if config.active_peer_device_id.as_deref() == Some(device_id.as_str()) {
+                        if config.app_role == "client" {
                             config.active_peer_device_id = None;
+                            config.last_pairing_error = Some(if reason.trim().is_empty() {
+                                "主控端已拒绝连接请求".into()
+                            } else {
+                                format!("主控端已拒绝连接请求：{reason}")
+                            });
                             foundation::save_config(&paths, &config)?;
                         }
                     }

@@ -139,6 +139,7 @@ export interface ConnectionStateDto {
   active_peer_device_id: string | null;
   active_peer_display_name: string | null;
   active_peer_state: string;
+  last_pairing_error: string | null;
   pending_pairing_requests: PendingPairingRequestDto[];
 }
 

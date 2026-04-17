@@ -95,6 +95,7 @@ struct ConnectionStateDto {
     active_peer_device_id: Option<String>,
     active_peer_display_name: Option<String>,
     active_peer_state: String,
+    last_pairing_error: Option<String>,
     pending_pairing_requests: Vec<PendingPairingRequestDto>,
 }
 
@@ -769,6 +770,7 @@ fn get_connection_state(state: tauri::State<'_, AppState>) -> Result<ConnectionS
         active_peer_device_id: config.active_peer_device_id,
         active_peer_display_name,
         active_peer_state: active_peer_state.into(),
+        last_pairing_error: config.last_pairing_error,
         pending_pairing_requests: pending,
     })
 }
@@ -799,6 +801,9 @@ fn set_app_role(
             .lock()
             .map_err(|_| "failed to access app config".to_string())?;
         config.app_role = role.clone();
+        if role != "client" {
+            config.last_pairing_error = None;
+        }
         save_config(&state.data_paths, &config).map_err(|error| error.to_string())?;
     }
 
@@ -829,9 +834,11 @@ fn set_controller_service_enabled(
             if config.current_pairing_code.is_none() {
                 config.current_pairing_code = Some(generate_pairing_code());
             }
+            config.last_pairing_error = None;
         } else {
             config.current_pairing_code = None;
             config.active_peer_device_id = None;
+            config.last_pairing_error = None;
         }
         if enabled && config.active_peer_device_id.is_none() {
             let devices = load_trust_store(&state.data_paths).map_err(|error| error.to_string())?;
@@ -923,6 +930,7 @@ fn submit_discovery_pairing_request(
             .map_err(|_| "failed to access app config".to_string())?;
         config.app_role = "client".into();
         config.active_peer_device_id = Some(peer.device_id.clone());
+        config.last_pairing_error = None;
         save_config(&state.data_paths, &config).map_err(|error| error.to_string())?;
     }
     {
@@ -1048,6 +1056,7 @@ fn disconnect_active_peer(state: tauri::State<'_, AppState>) -> Result<Connectio
             .lock()
             .map_err(|_| "failed to access app config".to_string())?;
         config.active_peer_device_id = None;
+        config.last_pairing_error = None;
         if config.app_role == "controller" {
             config.controller_service_enabled = false;
             config.current_pairing_code = None;
@@ -1400,6 +1409,7 @@ fn connect_to_manual_endpoint(
         if let Some(peer) = known_controller.as_ref() {
             config.active_peer_device_id = Some(peer.device_id.clone());
         }
+        config.last_pairing_error = None;
         save_config(&state.data_paths, &config).map_err(|error| error.to_string())?;
     }
 
@@ -1630,6 +1640,7 @@ fn repair_managed_device(
                 .map_err(|_| "failed to access app config".to_string())?;
             if config.active_peer_device_id.as_deref() == Some(&request.device_id) {
                 config.active_peer_device_id = None;
+                config.last_pairing_error = None;
                 save_config(&state.data_paths, &config).map_err(|error| error.to_string())?;
             }
         }
