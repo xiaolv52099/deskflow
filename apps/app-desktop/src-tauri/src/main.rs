@@ -853,12 +853,12 @@ fn submit_discovery_pairing_request(
         .map_err(|error| error.to_string())?
         .into_iter()
         .find(|peer| peer.device_id == request.device_id)
-        .ok_or_else(|| "?????????????".to_string())?;
+        .ok_or_else(|| "未找到可发起请求的主控设备".to_string())?;
 
     let local_identity = load_or_create_identity(&state.data_paths, &default_display_name())
         .map_err(|error| error.to_string())?;
     if peer.device_id == local_identity.device_id.to_string() {
-        return Err("?????????".into());
+        return Err("不能和自己设备配对".into());
     }
     let local_certificate = load_or_create_certificate(&state.data_paths, &local_identity)
         .map_err(|error| error.to_string())?;
@@ -867,7 +867,7 @@ fn submit_discovery_pairing_request(
         &local_certificate,
         &manual_endpoint(detect_local_host_ip(), SESSION_PORT),
     );
-    let pairing_code = generate_pairing_code();
+    let pairing_code = format!("auto:{}", unix_time_now_ms());
     let frame = core_protocol::ProtocolFrame::new(core_protocol::ProtocolMessage::PairRequest {
         device: local_descriptor,
         pairing_code: PairingCode {
@@ -918,12 +918,15 @@ fn respond_to_pending_pairing(
     save_pending_pairing_requests(&state.data_paths, &remaining).map_err(|error| error.to_string())?;
 
     if request.accept {
-        let expected_code = controller_config
-            .current_pairing_code
-            .clone()
-            .ok_or_else(|| "主控端当前没有可用配对码".to_string())?;
-        if target.pairing_code != expected_code {
-            return Err("配对码校验失败，请刷新主控端配对码后重试".into());
+        let is_auto_discovery_request = target.pairing_code.starts_with("auto:");
+        if !is_auto_discovery_request {
+            let expected_code = controller_config
+                .current_pairing_code
+                .clone()
+                .ok_or_else(|| "主控端当前没有可用配对码".to_string())?;
+            if target.pairing_code != expected_code {
+                return Err("配对码校验失败，请刷新主控端配对码后重试".into());
+            }
         }
 
         let pairing_request = PairingRequest {
@@ -1252,14 +1255,14 @@ fn connect_to_manual_endpoint(
 ) -> Result<PairingConnectResultDto, String> {
     let host = request.host.trim();
     if host.is_empty() {
-        return Err("?????? IP ??".into());
+        return Err("请输入主控端 IP 地址".into());
     }
     let pairing_code = request.pairing_code.trim();
     if pairing_code.is_empty() {
-        return Err("??????".into());
+        return Err("请输入配对码".into());
     }
     if is_local_endpoint_host(host) {
-        return Err("??????????".into());
+        return Err("不能连接当前设备自身".into());
     }
 
     let controller_descriptor = build_manual_peer_descriptor(host, request.port, pairing_code);
@@ -1274,7 +1277,7 @@ fn connect_to_manual_endpoint(
         .map_err(|error| error.to_string())?;
     if let Some(peer) = known_controller.as_ref() {
         if peer.device_id == local_identity.device_id.to_string() {
-            return Err("?????????".into());
+            return Err("不能和自己设备配对".into());
         }
     }
     let local_certificate = load_or_create_certificate(&state.data_paths, &local_identity)

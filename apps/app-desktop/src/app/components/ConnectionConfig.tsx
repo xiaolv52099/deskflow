@@ -147,6 +147,7 @@ export function ConnectionConfig() {
   const [error, setError] = useState("");
   const [discoveryPromptPeerId, setDiscoveryPromptPeerId] = useState<string | null>(null);
   const [controllerPromptDeviceId, setControllerPromptDeviceId] = useState<string | null>(null);
+  const [dismissedDiscoveryPeerIds, setDismissedDiscoveryPeerIds] = useState<string[]>([]);
 
   const isController = connectionState?.app_role !== "client";
 
@@ -171,6 +172,9 @@ export function ConnectionConfig() {
     setDiscoveredPeers(nextPeers);
     setConnectionState(nextConnectionState);
 
+    if (error) {
+      return;
+    }
     if (nextConnectionState.controller_service_enabled) {
       setStatusText(`主控服务已启用，正在监听 ${nextProfile.lan_ip}:${nextProfile.session_port}`);
       return;
@@ -217,12 +221,14 @@ export function ConnectionConfig() {
 
   useEffect(() => {
     if (!isController && !discoveryPromptPeerId) {
-      const nextPeer = availableDiscoveredPeers.find((peer) => !trustedDeviceIds.has(peer.device_id));
+      const nextPeer = availableDiscoveredPeers.find(
+        (peer) => !trustedDeviceIds.has(peer.device_id) && !dismissedDiscoveryPeerIds.includes(peer.device_id),
+      );
       if (nextPeer) {
         setDiscoveryPromptPeerId(nextPeer.device_id);
       }
     }
-  }, [availableDiscoveredPeers, discoveryPromptPeerId, isController, trustedDeviceIds]);
+  }, [availableDiscoveredPeers, discoveryPromptPeerId, dismissedDiscoveryPeerIds, isController, trustedDeviceIds]);
 
   useEffect(() => {
     if (isController && !controllerPromptDeviceId && connectionState?.pending_pairing_requests.length) {
@@ -280,8 +286,9 @@ export function ConnectionConfig() {
     try {
       setError("");
       const issuedPairingCode = await submitDiscoveryPairingRequest(peer.device_id);
+      setDismissedDiscoveryPeerIds((current) => current.filter((id) => id !== peer.device_id));
       setDiscoveryPromptPeerId(null);
-      setStatusText(`已向 ${peer.display_name} 发起连接请求，等待主控端确认。请求码：${issuedPairingCode}`);
+      setStatusText(`已向 ${peer.display_name} 发起连接请求，等待主控端确认。请求标识：${issuedPairingCode}`);
     } catch (nextError) {
       setError(formatError(nextError));
     }
@@ -408,7 +415,11 @@ export function ConnectionConfig() {
                 启用主控服务
               </button>
               <button
-                className="flex flex-1 items-center justify-center gap-2 rounded-md bg-slate-700 px-3 py-2 text-xs font-medium text-slate-100 transition-colors hover:bg-slate-600 disabled:bg-slate-800 disabled:text-slate-500"
+                className={`flex flex-1 items-center justify-center gap-2 rounded-md px-3 py-2 text-xs font-medium transition-colors ${
+                  controllerServiceEnabled
+                    ? "bg-rose-600 text-white hover:bg-rose-500"
+                    : "bg-slate-700 text-slate-100 hover:bg-slate-600 disabled:bg-slate-800 disabled:text-slate-500"
+                }`}
                 disabled={!controllerServiceEnabled}
                 onClick={() => void handleToggleControllerService(false)}
                 type="button"
@@ -676,11 +687,22 @@ export function ConnectionConfig() {
               </button>
             </div>
 
-            {connectionState?.active_peer_display_name ? (
-              <div className="rounded-md border border-emerald-500/20 bg-emerald-400/10 p-2 text-[10px] text-emerald-400">
-                当前已连接到主控端：{connectionState.active_peer_display_name}
+            <div
+              className={`rounded-md border p-3 text-[10px] ${
+                connectionState?.active_peer_display_name
+                  ? "border-emerald-500/20 bg-emerald-400/10 text-emerald-400"
+                  : "border-slate-700/60 bg-slate-900/50 text-slate-400"
+              }`}
+            >
+              <div className="text-[11px] font-medium">
+                {connectionState?.active_peer_display_name ? "已连接主控端" : "当前未连接"}
               </div>
-            ) : null}
+              <div className="mt-1">
+                {connectionState?.active_peer_display_name
+                  ? connectionState.active_peer_display_name
+                  : "可通过自动发现或手动配对连接主控端"}
+              </div>
+            </div>
 
             <div className="mt-auto rounded-md border border-emerald-500/20 bg-emerald-400/10 p-2 text-[10px] text-emerald-400">
               {statusText}
@@ -710,7 +732,15 @@ export function ConnectionConfig() {
               </button>
               <button
                 className="flex-1 rounded-md bg-slate-700 px-3 py-2 text-xs font-medium text-slate-200 hover:bg-slate-600"
-                onClick={() => setDiscoveryPromptPeerId(null)}
+                onClick={() => {
+                  setDismissedDiscoveryPeerIds((current) =>
+                    discoveryPromptPeer && !current.includes(discoveryPromptPeer.device_id)
+                      ? [...current, discoveryPromptPeer.device_id]
+                      : current,
+                  );
+                  setDiscoveryPromptPeerId(null);
+                  setStatusText("已忽略该主控设备，本次发现周期内不再弹出提示");
+                }}
                 type="button"
               >
                 暂不连接

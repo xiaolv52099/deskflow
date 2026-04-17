@@ -236,10 +236,9 @@ pub fn managed_devices_from_trust_store(
     trust_store
         .devices
         .iter()
+        .filter(|device| device.revoked_at_unix_ms.is_none())
         .map(|device| {
-            let status = if device.revoked_at_unix_ms.is_some() {
-                ManagedDeviceStatus::Revoked
-            } else if device
+            let status = if device
                 .last_seen_unix_ms
                 .is_some_and(|last_seen| now_unix_ms.saturating_sub(last_seen) <= offline_after_ms as u128)
             {
