@@ -12,32 +12,34 @@ use core_input::{
 use core_protocol::{DeviceDescriptor, PairingCode};
 use core_service::run_core_service;
 use core_session::{
-    apply_device_repair, managed_devices_from_trust_store, schedule_device_reconnect,
-    build_client_tls_config, manual_endpoint, process_pairing_request, session_descriptor, DeviceRepairAction,
-    ManagedDevice, ManagedDeviceStatus, PairingDecision, PairingRequest, DISCOVERY_PORT, SESSION_PORT,
-    DEFAULT_OFFLINE_AFTER_MS,
+    apply_device_repair, build_client_tls_config, managed_devices_from_trust_store,
+    manual_endpoint, process_pairing_request, schedule_device_reconnect, session_descriptor,
+    DeviceRepairAction, ManagedDevice, ManagedDeviceStatus, PairingDecision, PairingRequest,
+    DEFAULT_OFFLINE_AFTER_MS, DISCOVERY_PORT, SESSION_PORT,
 };
-use core_topology::{apply_hot_update, load_or_create_topology, save_topology, GridPosition, TopologyLayout};
+use core_topology::{
+    apply_hot_update, load_or_create_topology, save_topology, GridPosition, TopologyLayout,
+};
 use device_trust::{
     default_display_name, load_or_create_certificate, load_or_create_identity, load_trust_store,
     revoke_trusted_device, save_identity,
 };
 use foundation::{
-    append_log, export_extended_diagnostic_snapshot, load_cached_peer_descriptors, load_discovery_peers,
-    load_or_create_config, load_pending_pairing_requests, read_recent_log_lines, remove_cached_peer_descriptor,
-    save_config, save_discovery_peers, save_pending_pairing_requests, upsert_cached_peer_descriptor, AppConfig,
-    AppPaths, CachedPeerDescriptor, DiagnosticMetric, DiscoveryPeer, DATA_ROOT_ENV_VAR,
+    append_log, export_extended_diagnostic_snapshot, load_cached_peer_descriptors,
+    load_discovery_peers, load_or_create_config, load_pending_pairing_requests,
+    read_recent_log_lines, remove_cached_peer_descriptor, save_config, save_discovery_peers,
+    save_pending_pairing_requests, upsert_cached_peer_descriptor, AppConfig, AppPaths,
+    CachedPeerDescriptor, DiagnosticMetric, DiscoveryPeer, DATA_ROOT_ENV_VAR,
 };
 use local_ipc::{send_command, CoreToUiEvent, UiToCoreCommand};
 use serde::{Deserialize, Serialize};
-use std::io::{BufReader, BufWriter, Read, Write};
 use std::fs;
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::menu::{MenuBuilder, MenuEvent, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager};
-use tauri_plugin_dialog::DialogExt;
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 #[cfg(windows)]
@@ -50,6 +52,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 const DISCOVERY_PEER_TTL_MS: u128 = 8_000;
+const TRANSFER_IO_TIMEOUT_SECS: u64 = 120;
+const MAX_TRANSFER_ACK_BYTES: u64 = 64 * 1024;
 #[cfg(windows)]
 const SINGLE_INSTANCE_MUTEX_NAME: &str = "DeskflowPlus.SingleInstance";
 #[cfg(windows)]
@@ -279,6 +283,8 @@ struct TransferRecord {
     confirmed_at_unix_ms: Option<u128>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    artifacts: Vec<TransferArtifactRef>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -286,6 +292,13 @@ struct TransferRecord {
 struct TransferArtifactRequest {
     transfer_id: String,
     file_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct TransferArtifactRef {
+    file_name: String,
+    path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -447,7 +460,7 @@ fn main() {
             trust_discovered_peer,
             get_input_tuning,
             update_input_tuning,
-            select_transfer_files,
+            describe_transfer_files,
             create_transfer_plan,
             list_transfer_plans,
             get_transfer_artifact_path,
@@ -468,16 +481,10 @@ fn main() {
 }
 
 #[tauri::command]
-fn select_transfer_files(app: tauri::AppHandle) -> Result<Vec<SelectedTransferFileDto>, String> {
-    let Some(paths) = app.dialog().file().blocking_pick_files() else {
-        return Ok(Vec::new());
-    };
-
+fn describe_transfer_files(paths: Vec<String>) -> Result<Vec<SelectedTransferFileDto>, String> {
     let mut selected = Vec::new();
     for path in paths {
-        let Ok(path) = path.into_path() else {
-            continue;
-        };
+        let path = PathBuf::from(path);
         let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
         if !metadata.is_file() {
             continue;
@@ -610,7 +617,9 @@ fn initialize_app_state() -> Result<AppState> {
         }
     };
     let protocol_version = match runtime.block_on(wait_until_ready_with_retry(40, 100)) {
-        Ok(CoreToUiEvent::Ready { protocol_version, .. }) => protocol_version,
+        Ok(CoreToUiEvent::Ready {
+            protocol_version, ..
+        }) => protocol_version,
         Ok(other) => {
             if let Ok(mut slot) = boot_error.lock() {
                 *slot = Some(format!("unexpected readiness event: {other:?}"));
@@ -832,7 +841,8 @@ fn get_connection_state(state: tauri::State<'_, AppState>) -> Result<ConnectionS
         *config_slot = config.clone();
     }
     let trust_store = load_trust_store(&state.data_paths).map_err(|error| error.to_string())?;
-    let discovery_peers = load_discovery_peers(&state.data_paths).map_err(|error| error.to_string())?;
+    let discovery_peers =
+        load_discovery_peers(&state.data_paths).map_err(|error| error.to_string())?;
     let managed = managed_devices_from_trust_store(
         &trust_store,
         unix_time_now_ms(),
@@ -847,14 +857,20 @@ fn get_connection_state(state: tauri::State<'_, AppState>) -> Result<ConnectionS
     }
     let now = unix_time_now_ms();
     let active_peer_state = if let Some(device_id) = config.active_peer_device_id.as_ref() {
-        let trusted_match = trust_store
-            .trusted_device(Uuid::parse_str(device_id).map_err(|error: uuid::Error| error.to_string())?);
-        let managed_match = managed.iter().find(|device| device.device_id.to_string() == *device_id);
-        let discovery_match = discovery_peers.iter().find(|peer| peer.device_id == *device_id);
+        let trusted_match = trust_store.trusted_device(
+            Uuid::parse_str(device_id).map_err(|error: uuid::Error| error.to_string())?,
+        );
+        let managed_match = managed
+            .iter()
+            .find(|device| device.device_id.to_string() == *device_id);
+        let discovery_match = discovery_peers
+            .iter()
+            .find(|peer| peer.device_id == *device_id);
         let controller_peer_online = discovery_match.is_some_and(|peer| {
             now.saturating_sub(peer.discovered_at_unix_ms) <= DISCOVERY_PEER_TTL_MS
         });
-        let managed_peer_online = managed_match.is_some_and(|device| device.status == ManagedDeviceStatus::Online);
+        let managed_peer_online =
+            managed_match.is_some_and(|device| device.status == ManagedDeviceStatus::Online);
         if config.app_role == "client" {
             if trusted_match.is_some() && controller_peer_online {
                 "connected"
@@ -982,11 +998,12 @@ fn set_controller_service_enabled(
         save_discovery_peers(&state.data_paths, &[]).map_err(|error| error.to_string())?;
         let identity = load_or_create_identity(&state.data_paths, &default_display_name())
             .map_err(|error| error.to_string())?;
-        let frame = core_protocol::ProtocolFrame::new(core_protocol::ProtocolMessage::DiscoverWithdraw {
-            device_id: identity.device_id.to_string(),
-        })
-        .encode_json_line()
-        .map_err(|error| error.to_string())?;
+        let frame =
+            core_protocol::ProtocolFrame::new(core_protocol::ProtocolMessage::DiscoverWithdraw {
+                device_id: identity.device_id.to_string(),
+            })
+            .encode_json_line()
+            .map_err(|error| error.to_string())?;
         let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|error| error.to_string())?;
         let _ = socket.set_broadcast(true);
         let _ = socket.send_to(&frame, format!("255.255.255.255:{DISCOVERY_PORT}"));
@@ -1073,7 +1090,8 @@ fn respond_to_pending_pairing(
     state: tauri::State<'_, AppState>,
     request: ConfirmPendingPairingRequest,
 ) -> Result<ConnectionStateDto, String> {
-    let controller_config = load_or_create_config(&state.data_paths).map_err(|error| error.to_string())?;
+    let controller_config =
+        load_or_create_config(&state.data_paths).map_err(|error| error.to_string())?;
     if controller_config.app_role != "controller" {
         return Err("当前设备不是主控端，不能处理配对请求".into());
     }
@@ -1083,7 +1101,8 @@ fn respond_to_pending_pairing(
 
     let local_identity = load_or_create_identity(&state.data_paths, &default_display_name())
         .map_err(|error| error.to_string())?;
-    let pending = load_pending_pairing_requests(&state.data_paths).map_err(|error| error.to_string())?;
+    let pending =
+        load_pending_pairing_requests(&state.data_paths).map_err(|error| error.to_string())?;
     let target = pending
         .iter()
         .find(|item| item.device_id == request.device_id)
@@ -1098,7 +1117,8 @@ fn respond_to_pending_pairing(
         .into_iter()
         .filter(|item| item.device_id != request.device_id)
         .collect::<Vec<_>>();
-    save_pending_pairing_requests(&state.data_paths, &remaining).map_err(|error| error.to_string())?;
+    save_pending_pairing_requests(&state.data_paths, &remaining)
+        .map_err(|error| error.to_string())?;
 
     if request.accept {
         let is_auto_discovery_request = target.pairing_code.starts_with("auto:");
@@ -1247,8 +1267,7 @@ fn place_topology_device(
     device_id: String,
     position: GridPositionDto,
 ) -> Result<TopologySnapshot, String> {
-    let device_id =
-        Uuid::parse_str(&device_id).map_err(|error: uuid::Error| error.to_string())?;
+    let device_id = Uuid::parse_str(&device_id).map_err(|error: uuid::Error| error.to_string())?;
     let mut topology = state
         .topology
         .lock()
@@ -1274,8 +1293,7 @@ fn mark_topology_device_offline(
     state: tauri::State<'_, AppState>,
     device_id: String,
 ) -> Result<TopologySnapshot, String> {
-    let device_id =
-        Uuid::parse_str(&device_id).map_err(|error: uuid::Error| error.to_string())?;
+    let device_id = Uuid::parse_str(&device_id).map_err(|error: uuid::Error| error.to_string())?;
     let mut topology = state
         .topology
         .lock()
@@ -1412,7 +1430,12 @@ fn simulate_image_clipboard_broadcast(
     let bytes = deterministic_bgra_image(request.width, request.height)
         .map_err(|error| error.to_string())?;
     let update = clipboard
-        .create_local_image_update(ImageClipboardFormat::Bgra8, request.width, request.height, bytes)
+        .create_local_image_update(
+            ImageClipboardFormat::Bgra8,
+            request.width,
+            request.height,
+            bytes,
+        )
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "image clipboard broadcast suppressed".to_string())?;
     let core_clipboard::ClipboardContent::Image(payload) = update.content else {
@@ -1484,8 +1507,8 @@ fn connect_to_manual_endpoint(
     }
 
     let controller_descriptor = build_manual_peer_descriptor(host, request.port, pairing_code);
-    let discovery_snapshot = load_discovery_peers(&state.data_paths)
-        .map_err(|error| error.to_string())?;
+    let discovery_snapshot =
+        load_discovery_peers(&state.data_paths).map_err(|error| error.to_string())?;
     let known_controller = discovery_snapshot
         .iter()
         .find(|peer| peer.address == host && peer.port == request.port)
@@ -1685,17 +1708,45 @@ fn update_input_tuning(
 }
 
 #[tauri::command]
-fn create_transfer_plan(
+async fn create_transfer_plan(
     state: tauri::State<'_, AppState>,
     request: TransferPlanRequest,
 ) -> Result<TransferRecord, String> {
+    let data_paths = state.data_paths.clone();
+    let source_device_id = {
+        let clipboard = state
+            .clipboard
+            .lock()
+            .map_err(|_| "failed to access clipboard state".to_string())?;
+        clipboard.local_device_id()
+    };
+    let record = tauri::async_runtime::spawn_blocking(move || {
+        create_transfer_plan_blocking(data_paths, source_device_id, request)
+    })
+    .await
+    .map_err(|error| format!("file transfer worker failed: {error}"))?
+    .map_err(|error| error.to_string())?;
+
+    state
+        .transfer_records
+        .lock()
+        .map_err(|_| "failed to access transfer records".to_string())?
+        .push(record.clone());
+    Ok(record)
+}
+
+fn create_transfer_plan_blocking(
+    data_paths: AppPaths,
+    source_device_id: Uuid,
+    request: TransferPlanRequest,
+) -> Result<TransferRecord> {
     let target_device_id =
-        Uuid::parse_str(&request.target_device_id).map_err(|error: uuid::Error| error.to_string())?;
-    let trust_store = load_trust_store(&state.data_paths).map_err(|error| error.to_string())?;
+        Uuid::parse_str(&request.target_device_id).context("parse transfer target device id")?;
+    let trust_store = load_trust_store(&data_paths)?;
     let trusted_target = trust_store
         .trusted_device(target_device_id)
         .cloned()
-        .ok_or_else(|| "target device is not trusted".to_string())?;
+        .ok_or_else(|| anyhow::anyhow!("target device is not trusted"))?;
     let managed_devices = managed_devices_from_trust_store(
         &trust_store,
         unix_time_now_ms(),
@@ -1706,12 +1757,12 @@ fn create_transfer_plan(
         .find(|device| device.device_id == target_device_id)
         .is_some_and(|device| device.status == ManagedDeviceStatus::Online);
     if !target_online {
-        return Err("target device is currently offline".to_string());
+        anyhow::bail!("target device is currently offline");
     }
 
     let now = unix_time_now_ms();
-    let discovery_peers = load_discovery_peers(&state.data_paths).map_err(|error| error.to_string())?;
-    let cached_peers = load_cached_peer_descriptors(&state.data_paths).map_err(|error| error.to_string())?;
+    let discovery_peers = load_discovery_peers(&data_paths)?;
+    let cached_peers = load_cached_peer_descriptors(&data_paths)?;
     let remote = discovery_peers
         .iter()
         .filter(|peer| now.saturating_sub(peer.discovered_at_unix_ms) <= DISCOVERY_PEER_TTL_MS)
@@ -1723,22 +1774,27 @@ fn create_transfer_plan(
                 .find(|peer| peer.device_id == trusted_target.device_id.to_string())
                 .map(cached_peer_to_descriptor)
         })
-        .ok_or_else(|| "target device is not currently reachable".to_string())?;
-    let source_device_id = {
-        let clipboard = state
-            .clipboard
-            .lock()
-            .map_err(|_| "failed to access clipboard state".to_string())?;
-        clipboard.local_device_id()
-    };
+        .ok_or_else(|| anyhow::anyhow!("target device is not currently reachable"))?;
     let outbound_files = request
         .files
         .into_iter()
         .map(|file| {
             let path = PathBuf::from(&file.path);
-            let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
+            let metadata = fs::metadata(&path)
+                .with_context(|| format!("read transfer source metadata {}", path.display()))?;
             if !metadata.is_file() {
-                return Err(format!("transfer source is not a file: {}", path.display()));
+                anyhow::bail!("transfer source is not a file: {}", path.display());
+            }
+            if file.size_bytes != 0 && file.size_bytes != metadata.len() {
+                append_log(
+                    &data_paths,
+                    &format!(
+                        "transfer source size changed for {}: ui={} actual={}",
+                        path.display(),
+                        file.size_bytes,
+                        metadata.len()
+                    ),
+                )?;
             }
             Ok(TransferArtifactFile {
                 name: file.name,
@@ -1748,7 +1804,7 @@ fn create_transfer_plan(
         })
         .collect::<Result<Vec<_>, _>>()?;
     if outbound_files.is_empty() {
-        return Err("no files selected for transfer".to_string());
+        anyhow::bail!("no files selected for transfer");
     }
 
     let transfer_files = outbound_files
@@ -1761,24 +1817,17 @@ fn create_transfer_plan(
         .collect();
     let plan = approve_transfer(
         plan_transfer(source_device_id, target_device_id, transfer_files, None)
-            .map_err(|error| error.to_string())?,
+            .context("create transfer plan")?,
     );
-    let record = execute_remote_transfer(&state.data_paths, &remote, plan, &outbound_files)
-        .map_err(|error| error.to_string())?;
-    persist_outbound_transfer_artifacts(&state.data_paths, &record, &outbound_files)
-        .map_err(|error| error.to_string())?;
-    state
-        .transfer_records
-        .lock()
-        .map_err(|_| "failed to access transfer records".to_string())?
-        .push(record.clone());
+    let record = execute_remote_transfer(&data_paths, &remote, plan, &outbound_files)?;
+    persist_outbound_transfer_artifacts(&data_paths, &record, &outbound_files)?;
     Ok(record)
 }
 
 fn persist_outbound_transfer_artifacts(
     paths: &AppPaths,
     record: &TransferRecord,
-    files: &[TransferArtifactFile],
+    _files: &[TransferArtifactFile],
 ) -> Result<()> {
     paths.ensure_layout()?;
     let transfer_dir = paths
@@ -1790,18 +1839,13 @@ fn persist_outbound_transfer_artifacts(
     let summary = serde_json::to_string_pretty(record).context("serialize transfer record")?;
     fs::write(&summary_path, summary).context("write transfer record summary")?;
 
-    for file in files {
-        let file_path = transfer_dir.join(&file.name);
-        fs::copy(&file.source_path, &file_path)
-            .with_context(|| format!("write outbound transfer artifact {}", file_path.display()))?;
-    }
-
     Ok(())
 }
 
 #[tauri::command]
 fn list_transfer_plans(state: tauri::State<'_, AppState>) -> Result<Vec<TransferRecord>, String> {
-    let records = load_transfer_records_from_disk(&state.data_paths).map_err(|error| error.to_string())?;
+    let records =
+        load_transfer_records_from_disk(&state.data_paths).map_err(|error| error.to_string())?;
     {
         let mut slot = state
             .transfer_records
@@ -1827,8 +1871,9 @@ fn reveal_transfer_artifact_location(
     state: tauri::State<'_, AppState>,
     request: TransferArtifactRequest,
 ) -> Result<(), String> {
-    let path = resolve_transfer_artifact_path(&state.data_paths, &request.transfer_id, &request.file_name)
-        .map_err(|error| error.to_string())?;
+    let path =
+        resolve_transfer_artifact_path(&state.data_paths, &request.transfer_id, &request.file_name)
+            .map_err(|error| error.to_string())?;
     reveal_path_in_system(&path).map_err(|error| error.to_string())
 }
 
@@ -1896,7 +1941,10 @@ fn repair_managed_device(
         .map_err(|_| "failed to access managed devices".to_string())?;
     if action == DeviceRepairAction::Revoke {
         devices.retain(|device| device.device_id != device_id);
-    } else if let Some(existing) = devices.iter_mut().find(|device| device.device_id == device_id) {
+    } else if let Some(existing) = devices
+        .iter_mut()
+        .find(|device| device.device_id == device_id)
+    {
         *existing = match action {
             DeviceRepairAction::RetryNow => {
                 schedule_device_reconnect(existing, existing.reconnect_attempt.saturating_add(1))
@@ -1961,11 +2009,27 @@ fn export_diagnostics(state: tauri::State<'_, AppState>) -> Result<DiagnosticExp
         .clone();
 
     let metrics = vec![
-        metric("protocol_version", health.protocol_version.to_string(), "passed"),
-        metric("topology_version", health.topology_version.to_string(), "passed"),
-        metric("topology_devices", topology.devices.len().to_string(), "passed"),
+        metric(
+            "protocol_version",
+            health.protocol_version.to_string(),
+            "passed",
+        ),
+        metric(
+            "topology_version",
+            health.topology_version.to_string(),
+            "passed",
+        ),
+        metric(
+            "topology_devices",
+            topology.devices.len().to_string(),
+            "passed",
+        ),
         metric("transfer_records", transfer_count.to_string(), "passed"),
-        metric("managed_devices", managed_devices.len().to_string(), "passed"),
+        metric(
+            "managed_devices",
+            managed_devices.len().to_string(),
+            "passed",
+        ),
         metric(
             "offline_devices",
             managed_devices
@@ -2023,6 +2087,13 @@ fn execute_remote_transfer(
         delivery_message: None,
         confirmed_at_unix_ms: None,
         error: None,
+        artifacts: files
+            .iter()
+            .map(|file| TransferArtifactRef {
+                file_name: file.name.clone(),
+                path: file.source_path.clone(),
+            })
+            .collect(),
     };
     let header = TransferSessionHeader {
         record: record.clone(),
@@ -2032,7 +2103,19 @@ fn execute_remote_transfer(
 
     let client_config = std::sync::Arc::new(build_client_tls_config(paths, remote)?);
     let stream = std::net::TcpStream::connect((remote.address.as_str(), remote.port))
-        .with_context(|| format!("connect remote transfer session {}:{}", remote.address, remote.port))?;
+        .with_context(|| {
+            format!(
+                "connect remote transfer session {}:{}",
+                remote.address, remote.port
+            )
+        })?;
+    let transfer_timeout = Some(std::time::Duration::from_secs(TRANSFER_IO_TIMEOUT_SECS));
+    stream
+        .set_read_timeout(transfer_timeout)
+        .context("set transfer read timeout")?;
+    stream
+        .set_write_timeout(transfer_timeout)
+        .context("set transfer write timeout")?;
     let server_name = rustls::pki_types::ServerName::try_from(remote.device_id.clone())
         .map_err(|_| anyhow::anyhow!("invalid remote server name"))?;
     let connection = rustls::ClientConnection::new(client_config, server_name)
@@ -2085,14 +2168,16 @@ fn execute_remote_transfer(
             writer
                 .write_all(chunk_bytes)
                 .context("write transfer chunk payload")?;
-            record.progress.transferred_bytes = (record.progress.transferred_bytes + bytes_read as u64)
+            record.progress.transferred_bytes = (record.progress.transferred_bytes
+                + bytes_read as u64)
                 .min(plan.manifest.total_bytes);
             record.progress.chunk_index = chunk_index;
-            record.progress.status = if record.progress.transferred_bytes >= plan.manifest.total_bytes {
-                core_file_transfer::TransferStatus::Completed
-            } else {
-                core_file_transfer::TransferStatus::InProgress
-            };
+            record.progress.status =
+                if record.progress.transferred_bytes >= plan.manifest.total_bytes {
+                    core_file_transfer::TransferStatus::Completed
+                } else {
+                    core_file_transfer::TransferStatus::InProgress
+                };
             offset += bytes_read as u64;
             chunk_index += 1;
         }
@@ -2105,11 +2190,17 @@ fn execute_remote_transfer(
         .into_inner()
         .map_err(|error| anyhow::anyhow!("extract transfer tls stream: {error}"))?;
     let mut length_bytes = [0u8; 8];
-    tls.read_exact(&mut length_bytes).context("read transfer ack length")?;
+    tls.read_exact(&mut length_bytes)
+        .context("read transfer ack length")?;
     let ack_len = u64::from_be_bytes(length_bytes);
+    if ack_len == 0 || ack_len > MAX_TRANSFER_ACK_BYTES {
+        anyhow::bail!("invalid transfer ack length: {ack_len}");
+    }
     let mut ack_bytes = vec![0u8; ack_len as usize];
-    tls.read_exact(&mut ack_bytes).context("read transfer ack payload")?;
-    let ack: TransferDeliveryAck = serde_json::from_slice(&ack_bytes).context("parse transfer ack payload")?;
+    tls.read_exact(&mut ack_bytes)
+        .context("read transfer ack payload")?;
+    let ack: TransferDeliveryAck =
+        serde_json::from_slice(&ack_bytes).context("parse transfer ack payload")?;
     record.elapsed_ms = started.elapsed().as_millis();
     if !ack.ok {
         record.delivery_state = "failed".into();
@@ -2142,8 +2233,12 @@ fn load_transfer_records_from_disk(paths: &AppPaths) -> Result<Vec<TransferRecor
             continue;
         }
 
-        let raw = fs::read_to_string(&summary_path)
-            .with_context(|| format!("read transfer record summary from {}", summary_path.display()))?;
+        let raw = fs::read_to_string(&summary_path).with_context(|| {
+            format!(
+                "read transfer record summary from {}",
+                summary_path.display()
+            )
+        })?;
         match serde_json::from_str::<TransferRecord>(&raw) {
             Ok(record) => records.push(record),
             Err(error) => {
@@ -2162,11 +2257,39 @@ fn load_transfer_records_from_disk(paths: &AppPaths) -> Result<Vec<TransferRecor
     Ok(records)
 }
 
-fn resolve_transfer_artifact_path(paths: &AppPaths, transfer_id: &str, file_name: &str) -> Result<std::path::PathBuf> {
+fn resolve_transfer_artifact_path(
+    paths: &AppPaths,
+    transfer_id: &str,
+    file_name: &str,
+) -> Result<std::path::PathBuf> {
     let transfer_id = transfer_id.trim();
     let file_name = file_name.trim();
     if transfer_id.is_empty() || file_name.is_empty() {
         anyhow::bail!("transfer artifact identity is incomplete");
+    }
+
+    let summary_path = paths
+        .transfers_dir()
+        .join(transfer_id)
+        .join("transfer-record.json");
+    if summary_path.exists() {
+        let raw = fs::read_to_string(&summary_path).with_context(|| {
+            format!(
+                "read transfer record summary from {}",
+                summary_path.display()
+            )
+        })?;
+        if let Ok(record) = serde_json::from_str::<TransferRecord>(&raw) {
+            if let Some(artifact) = record
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.file_name == file_name)
+            {
+                if artifact.path.exists() {
+                    return Ok(artifact.path.clone());
+                }
+            }
+        }
     }
 
     let candidate = paths.transfers_dir().join(transfer_id).join(file_name);
@@ -2235,7 +2358,11 @@ fn parse_device_repair_action(action: &str) -> Result<DeviceRepairAction, String
     }
 }
 
-fn metric(name: impl Into<String>, value: impl Into<String>, status: impl Into<String>) -> DiagnosticMetric {
+fn metric(
+    name: impl Into<String>,
+    value: impl Into<String>,
+    status: impl Into<String>,
+) -> DiagnosticMetric {
     DiagnosticMetric {
         name: name.into(),
         value: value.into(),
@@ -2296,7 +2423,10 @@ fn build_manual_peer_descriptor(host: &str, port: u16, pairing_code: &str) -> De
         normalized
     };
     DeviceDescriptor {
-        device_id: format!("00000000-0000-0000-0000-{}", format!("{suffix:0>12}")[..12].to_string()),
+        device_id: format!(
+            "00000000-0000-0000-0000-{}",
+            format!("{suffix:0>12}")[..12].to_string()
+        ),
         display_name: format!("Remote-{host}"),
         platform: "remote".into(),
         address: host.to_string(),
@@ -2322,12 +2452,20 @@ fn sync_topology_with_trusted_devices(state: &tauri::State<'_, AppState>) -> Res
         .collect::<std::collections::HashSet<_>>();
 
     let controller_device_id = topology.controller_device_id;
-    topology
-        .devices
-        .retain(|device| device.device_id == controller_device_id || trusted_ids.contains(&device.device_id));
+    topology.devices.retain(|device| {
+        device.device_id == controller_device_id || trusted_ids.contains(&device.device_id)
+    });
 
-    for device in trust_store.devices.into_iter().filter(|device| device.revoked_at_unix_ms.is_none()) {
-        if topology.devices.iter().any(|entry| entry.device_id == device.device_id) {
+    for device in trust_store
+        .devices
+        .into_iter()
+        .filter(|device| device.revoked_at_unix_ms.is_none())
+    {
+        if topology
+            .devices
+            .iter()
+            .any(|entry| entry.device_id == device.device_id)
+        {
             continue;
         }
         topology
@@ -2349,7 +2487,11 @@ fn auto_place_pending_topology_devices(layout: &mut TopologyLayout) -> Result<()
         .collect::<Vec<_>>();
 
     for device_id in pending_ids {
-        if layout.device(device_id).and_then(|device| device.position).is_some() {
+        if layout
+            .device(device_id)
+            .and_then(|device| device.position)
+            .is_some()
+        {
             continue;
         }
 
@@ -2361,7 +2503,11 @@ fn auto_place_pending_topology_devices(layout: &mut TopologyLayout) -> Result<()
                 }
 
                 let mut candidate = layout.clone();
-                if candidate.place_device(device_id, GridPosition { x, y }).is_ok() && candidate.validate().is_ok() {
+                if candidate
+                    .place_device(device_id, GridPosition { x, y })
+                    .is_ok()
+                    && candidate.validate().is_ok()
+                {
                     *layout = candidate;
                     placed = true;
                     break;
@@ -2376,12 +2522,17 @@ fn auto_place_pending_topology_devices(layout: &mut TopologyLayout) -> Result<()
     Ok(())
 }
 
-fn remove_device_from_topology(state: &tauri::State<'_, AppState>, device_id: Uuid) -> Result<(), String> {
+fn remove_device_from_topology(
+    state: &tauri::State<'_, AppState>,
+    device_id: Uuid,
+) -> Result<(), String> {
     let mut topology = state
         .topology
         .lock()
         .map_err(|_| "failed to access topology".to_string())?;
-    topology.devices.retain(|device| device.device_id != device_id);
+    topology
+        .devices
+        .retain(|device| device.device_id != device_id);
     save_topology(&state.data_paths, &topology).map_err(|error| error.to_string())?;
     update_health_version(state, topology.version)
 }
@@ -2416,7 +2567,10 @@ fn unix_time_now_ms() -> u128 {
         .as_millis()
 }
 
-fn update_health_version(state: &tauri::State<'_, AppState>, topology_version: u64) -> Result<(), String> {
+fn update_health_version(
+    state: &tauri::State<'_, AppState>,
+    topology_version: u64,
+) -> Result<(), String> {
     let mut health = state
         .health
         .lock()
@@ -2450,7 +2604,9 @@ fn snapshot_from_layout(layout: &TopologyLayout) -> TopologySnapshot {
 impl Drop for AppState {
     fn drop(&mut self) {
         if self.owns_core_service {
-            let _ = self.runtime.block_on(send_command(UiToCoreCommand::Shutdown));
+            let _ = self
+                .runtime
+                .block_on(send_command(UiToCoreCommand::Shutdown));
             if let Ok(mut join) = self.core_join.lock() {
                 if let Some(handle) = join.take() {
                     let _ = handle.join();

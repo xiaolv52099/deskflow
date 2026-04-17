@@ -5,8 +5,8 @@
     "current_phase": "feature-integration"
   },
   "meta": {
-    "last_updated": "2026-04-17T18:20:00+08:00",
-    "version": 8
+    "last_updated": "2026-04-18T01:30:18+08:00",
+    "version": 9
   },
   "assumptions": [
     "当前目标平台仅包含 Windows 和 macOS。",
@@ -79,8 +79,8 @@
       "title": "文件传输",
       "priority": "P1",
       "module": "file-transfer",
-      "status": "in_progress",
-      "summary": "正在将文件传输从整包内存 IPC 方案重构为 Rust 端流式分片传输，已完成路径选择与基础收发主干。",
+      "status": "ready_for_dual_device_verification",
+      "summary": "完成 Windows/macOS 文件选择与发送链路稳定性修复：文件选择迁移到前端 Tauri dialog，发送动作迁移到后台阻塞线程，发送端不再二次复制大文件。",
       "tests": [
         {
           "type": "build",
@@ -88,9 +88,25 @@
           "status": "passed"
         },
         {
-          "type": "unit",
-          "name": "cargo test -p core-file-transfer -- --nocapture",
+          "type": "build",
+          "name": "cargo check -p app-desktop -p core-service -j 1",
           "status": "passed"
+        },
+        {
+          "type": "unit",
+          "name": "cargo test -p core-file-transfer -j 1",
+          "status": "passed"
+        },
+        {
+          "type": "integration",
+          "name": "cargo test -p core-service --test foundation_integration -j 1",
+          "status": "passed"
+        },
+        {
+          "type": "integration",
+          "name": "cargo test -p app-desktop --test process_boundary",
+          "status": "blocked",
+          "detail": "本机 24800/24801 端口被已有核心服务占用，触发 os error 10048；需停掉运行中的应用或将测试端口改为可配置后再跑。"
         }
       ],
       "performance_checks": [
@@ -101,10 +117,11 @@
         }
       ],
       "notes": [
-        "前端已改为原生选择文件路径，不再通过 WebView 将整文件字节数组传入 Tauri IPC。",
-        "Rust 发送端已改为按文件路径流式读取、分片发送。",
-        "core-service 接收端已接入新的 session header 与 chunk header 主干，但仍需继续做双机大文件回归与旧路径清理。",
-        "当前 cargo check 与 npm run build 已通过。"
+        "macOS 文件选择不再调用 Rust blocking_pick_files，避免 Finder 对话框阻塞 Tauri command 线程。",
+        "Windows 点击发送不再在前端或 IPC 线程内执行网络与文件 I/O，降低 WebView 闪退和界面卡死风险。",
+        "发送端记录只保存 transfer-record.json 与原始文件路径，不再复制一份发送文件，避免大文件二次 I/O。",
+        "传输 TCP 读写增加 120 秒超时，会话头、分片头和 ACK 增加长度上限，降低异常连接导致的卡死或内存暴涨风险。",
+        "真实双机文件收发仍需在 Windows/macOS 各一台设备上做端到端验收。"
       ]
     },
     {
@@ -193,7 +210,7 @@
   "remaining_risks": [
     "自动发现与手动配对的真实双机确认流程仍需在两台设备上完成端到端回归。",
     "当前自动恢复连接状态以信任与活动设备状态恢复为主，尚未实现完整会话级重连握手。",
-    "真实跨设备文件传输数据面尚未接入 session 层网络传输。",
+    "真实跨设备文件传输数据面已接入流式分片传输，但仍需 Windows/macOS 双机实测确认系统文件对话框、传输速度和接收记录展示。",
     "macOS 运行权限、输入注入和最终打包验签仍需在 Mac 上继续完成实机验证。"
   ]
 }

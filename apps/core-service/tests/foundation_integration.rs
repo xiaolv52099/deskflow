@@ -28,10 +28,9 @@ fn foundation_roundtrip_supports_config_log_and_diagnostic_export() {
     assert!(paths.log_file().exists());
     assert!(diagnostic.exists());
 
-    let persisted: AppConfig = serde_json::from_str(
-        &fs::read_to_string(paths.config_file()).expect("read config file"),
-    )
-    .expect("parse config file");
+    let persisted: AppConfig =
+        serde_json::from_str(&fs::read_to_string(paths.config_file()).expect("read config file"))
+            .expect("parse config file");
 
     assert_eq!(persisted.log_level, "debug");
     assert!(!persisted.clipboard_enabled);
@@ -44,21 +43,31 @@ fn foundation_layout_includes_security_store_paths() {
 
     assert!(paths.security_dir().exists());
     assert_eq!(
-        paths.device_identity_file().file_name().expect("identity file name"),
+        paths
+            .device_identity_file()
+            .file_name()
+            .expect("identity file name"),
         "device-identity.json"
     );
     assert_eq!(
-        paths.device_certificate_file()
+        paths
+            .device_certificate_file()
             .file_name()
             .expect("certificate file name"),
         "device-certificate.json"
     );
     assert_eq!(
-        paths.trust_store_file().file_name().expect("trust store file name"),
+        paths
+            .trust_store_file()
+            .file_name()
+            .expect("trust store file name"),
         "trust-store.json"
     );
     assert_eq!(
-        paths.topology_file().file_name().expect("topology file name"),
+        paths
+            .topology_file()
+            .file_name()
+            .expect("topology file name"),
         "topology.json"
     );
 }

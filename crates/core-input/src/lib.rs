@@ -129,7 +129,11 @@ impl InputRouter {
         }
     }
 
-    pub fn route_event(&mut self, topology: &TopologyLayout, event: InputEvent) -> Result<InputRouteResult> {
+    pub fn route_event(
+        &mut self,
+        topology: &TopologyLayout,
+        event: InputEvent,
+    ) -> Result<InputRouteResult> {
         match event.clone() {
             InputEvent::MouseMove { position } => self.route_mouse_move(topology, position, event),
             _ => Ok(self.forward_or_keep(event)),
@@ -168,7 +172,9 @@ impl InputRouter {
         position: CursorPosition,
         event: InputEvent,
     ) -> Result<InputRouteResult> {
-        if let Some(direction) = detect_boundary_crossing(position, self.screen_width, self.screen_height) {
+        if let Some(direction) =
+            detect_boundary_crossing(position, self.screen_width, self.screen_height)
+        {
             if let Some(neighbor) = topology.neighbor(self.local_device_id, direction) {
                 self.active_target = ActiveInputTarget::Remote(neighbor.device_id);
                 return Ok(InputRouteResult {
@@ -227,10 +233,15 @@ pub fn tune_input_event(event: &InputEvent, profile: InputTuningProfile) -> Inpu
     }
 }
 
-pub fn tune_input_event_batch(event: &InputEvent, profile: InputTuningProfile) -> Vec<TimedInputEvent> {
+pub fn tune_input_event_batch(
+    event: &InputEvent,
+    profile: InputTuningProfile,
+) -> Vec<TimedInputEvent> {
     let profile = profile.normalized();
     match event {
-        InputEvent::MouseWheel { delta_x, delta_y } => smooth_wheel_events(*delta_x, *delta_y, profile),
+        InputEvent::MouseWheel { delta_x, delta_y } => {
+            smooth_wheel_events(*delta_x, *delta_y, profile)
+        }
         _ => vec![TimedInputEvent {
             event: tune_input_event(event, profile),
             delay_ms: 0,
@@ -238,7 +249,11 @@ pub fn tune_input_event_batch(event: &InputEvent, profile: InputTuningProfile) -
     }
 }
 
-pub fn smooth_wheel_events(delta_x: f64, delta_y: f64, profile: InputTuningProfile) -> Vec<TimedInputEvent> {
+pub fn smooth_wheel_events(
+    delta_x: f64,
+    delta_y: f64,
+    profile: InputTuningProfile,
+) -> Vec<TimedInputEvent> {
     let profile = profile.normalized();
     let scaled_x = delta_x * profile.wheel_speed_multiplier;
     let scaled_y = delta_y * profile.wheel_speed_multiplier;
@@ -252,7 +267,9 @@ pub fn smooth_wheel_events(delta_x: f64, delta_y: f64, profile: InputTuningProfi
         }];
     }
 
-    let steps = (1.0 + profile.wheel_smoothing_factor * 7.0).round().clamp(2.0, 8.0) as u64;
+    let steps = (1.0 + profile.wheel_smoothing_factor * 7.0)
+        .round()
+        .clamp(2.0, 8.0) as u64;
     let delay_step_ms = (2.0 + profile.wheel_smoothing_factor * 6.0).round() as u64;
     (0..steps)
         .map(|index| TimedInputEvent {
@@ -339,7 +356,8 @@ pub fn current_platform_input_status() -> PlatformInputStatus {
         injection_ready: false,
         cursor_query_ready: false,
         permission_state: PlatformPermissionState::RequiresUserAction,
-        note: "macOS adapter requires Accessibility and Input Monitoring bridge on macOS host".into(),
+        note: "macOS adapter requires Accessibility and Input Monitoring bridge on macOS host"
+            .into(),
     }
 }
 
@@ -422,13 +440,17 @@ mod windows_platform {
     pub fn inject_remote_event(event: &InputEvent) -> Result<()> {
         match event {
             InputEvent::MouseMove { position } => {
-                let ok = unsafe { SetCursorPos(position.x.round() as i32, position.y.round() as i32) };
+                let ok =
+                    unsafe { SetCursorPos(position.x.round() as i32, position.y.round() as i32) };
                 if ok == 0 {
                     anyhow::bail!("SetCursorPos failed");
                 }
                 Ok(())
             }
-            InputEvent::MouseWheel { delta_x: _, delta_y } => {
+            InputEvent::MouseWheel {
+                delta_x: _,
+                delta_y,
+            } => {
                 let input = INPUT {
                     r#type: INPUT_MOUSE,
                     Anonymous: INPUT_0 {
@@ -464,7 +486,13 @@ mod windows_platform {
     }
 
     fn send_inputs(inputs: &[INPUT]) -> Result<()> {
-        let sent = unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32) };
+        let sent = unsafe {
+            SendInput(
+                inputs.len() as u32,
+                inputs.as_ptr(),
+                size_of::<INPUT>() as i32,
+            )
+        };
         if sent != inputs.len() as u32 {
             anyhow::bail!("SendInput sent {sent} of {} events", inputs.len());
         }
@@ -526,7 +554,9 @@ mod tests {
         let controller = Uuid::new_v4();
         let client = Uuid::new_v4();
         let mut topology = TopologyLayout::new(controller, "controller");
-        topology.add_pending_device(client, "client").expect("add pending");
+        topology
+            .add_pending_device(client, "client")
+            .expect("add pending");
         topology
             .place_device(client, GridPosition { x: 2, y: 1 })
             .expect("place client");
@@ -540,7 +570,14 @@ mod tests {
             Some(EdgeDirection::Left)
         );
         assert_eq!(
-            detect_boundary_crossing(CursorPosition { x: 1920.0, y: 100.0 }, 1920.0, 1080.0),
+            detect_boundary_crossing(
+                CursorPosition {
+                    x: 1920.0,
+                    y: 100.0
+                },
+                1920.0,
+                1080.0
+            ),
             Some(EdgeDirection::Right)
         );
         assert_eq!(
@@ -548,7 +585,14 @@ mod tests {
             Some(EdgeDirection::Up)
         );
         assert_eq!(
-            detect_boundary_crossing(CursorPosition { x: 100.0, y: 1080.0 }, 1920.0, 1080.0),
+            detect_boundary_crossing(
+                CursorPosition {
+                    x: 100.0,
+                    y: 1080.0
+                },
+                1920.0,
+                1080.0
+            ),
             Some(EdgeDirection::Down)
         );
     }
@@ -733,7 +777,9 @@ mod tests {
 
         assert!(events.len() > 1);
         assert!((total_delta - 12.0).abs() < f64::EPSILON);
-        assert!(events.windows(2).all(|pair| pair[1].delay_ms > pair[0].delay_ms));
+        assert!(events
+            .windows(2)
+            .all(|pair| pair[1].delay_ms > pair[0].delay_ms));
     }
 
     #[test]

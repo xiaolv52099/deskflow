@@ -143,6 +143,7 @@ export function FileTransfer() {
   const [statusText, setStatusText] = useState("请先确保双端已连接，然后选择要发送的文件。");
   const [error, setError] = useState("");
   const [isDragging, setIsDragging] = useState(false);
+  const [isSending, setIsSending] = useState(false);
   const [copiedPath, setCopiedPath] = useState<string | null>(null);
   async function refresh() {
     const [nextRecords, nextDevices, nextConnectionState] = await Promise.all([
@@ -185,6 +186,7 @@ export function FileTransfer() {
   }
 
   async function handlePickFiles() {
+    if (isSending) return;
     try {
       setError("");
       const next = await selectTransferFiles();
@@ -195,6 +197,7 @@ export function FileTransfer() {
   }
 
   async function handleSendFiles() {
+    if (isSending) return;
     if (!pendingFiles.length) {
       setError("请先选择要发送的文件。");
       return;
@@ -206,6 +209,8 @@ export function FileTransfer() {
 
     try {
       setError("");
+      setIsSending(true);
+      setStatusText(`正在向 ${activePeer.display_name} 发送 ${pendingFiles.length} 个文件，请不要关闭应用。`);
       const payload = pendingFiles.map((file) => ({
         name: file.name,
         path: file.path,
@@ -217,6 +222,8 @@ export function FileTransfer() {
       await refresh();
     } catch (nextError) {
       setError(formatError(nextError));
+    } finally {
+      setIsSending(false);
     }
   }
 
@@ -302,12 +309,12 @@ export function FileTransfer() {
               </button>
               <button
                 className="flex flex-1 items-center justify-center gap-1.5 rounded-md bg-blue-600 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-blue-500 disabled:bg-slate-700 disabled:text-slate-400"
-                disabled={!pendingFiles.length || !canSend}
+                disabled={!pendingFiles.length || !canSend || isSending}
                 onClick={() => void handleSendFiles()}
                 type="button"
               >
                 <Send size={14} />
-                发送
+                {isSending ? "发送中" : "发送"}
               </button>
             </div>
 

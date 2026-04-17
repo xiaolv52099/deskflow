@@ -319,7 +319,8 @@ pub fn export_extended_diagnostic_snapshot(
         metrics,
     };
 
-    let raw = serde_json::to_string_pretty(&snapshot).context("serialize extended diagnostic snapshot")?;
+    let raw = serde_json::to_string_pretty(&snapshot)
+        .context("serialize extended diagnostic snapshot")?;
     let path = paths.diagnostic_dir().join("diagnostic-extended.json");
     fs::write(&path, raw).context("write extended diagnostic snapshot")?;
     Ok(path)
@@ -359,7 +360,8 @@ pub fn save_pending_pairing_requests(
     requests: &[PendingPairingRequest],
 ) -> Result<()> {
     paths.ensure_layout()?;
-    let raw = serde_json::to_string_pretty(requests).context("serialize pending pairing requests")?;
+    let raw =
+        serde_json::to_string_pretty(requests).context("serialize pending pairing requests")?;
     fs::write(paths.pairing_requests_file(), raw).context("write pending pairing requests")?;
     Ok(())
 }
@@ -375,7 +377,10 @@ pub fn load_cached_peer_descriptors(paths: &AppPaths) -> Result<Vec<CachedPeerDe
     serde_json::from_str(&raw).context("parse paired peer descriptors")
 }
 
-pub fn save_cached_peer_descriptors(paths: &AppPaths, peers: &[CachedPeerDescriptor]) -> Result<()> {
+pub fn save_cached_peer_descriptors(
+    paths: &AppPaths,
+    peers: &[CachedPeerDescriptor],
+) -> Result<()> {
     paths.ensure_layout()?;
     let raw = serde_json::to_string_pretty(peers).context("serialize paired peer descriptors")?;
     fs::write(paths.paired_peers_file(), raw).context("write paired peer descriptors")?;
@@ -384,7 +389,10 @@ pub fn save_cached_peer_descriptors(paths: &AppPaths, peers: &[CachedPeerDescrip
 
 pub fn upsert_cached_peer_descriptor(paths: &AppPaths, peer: CachedPeerDescriptor) -> Result<()> {
     let mut peers = load_cached_peer_descriptors(paths)?;
-    if let Some(existing) = peers.iter_mut().find(|item| item.device_id == peer.device_id) {
+    if let Some(existing) = peers
+        .iter_mut()
+        .find(|item| item.device_id == peer.device_id)
+    {
         *existing = peer;
     } else {
         peers.push(peer);
@@ -436,9 +444,7 @@ mod tests {
     use super::*;
 
     fn test_paths(name: &str) -> AppPaths {
-        let root = std::env::temp_dir()
-            .join("deskflow-plus-tests")
-            .join(name);
+        let root = std::env::temp_dir().join("deskflow-plus-tests").join(name);
         if root.exists() {
             let _ = fs::remove_dir_all(&root);
         }

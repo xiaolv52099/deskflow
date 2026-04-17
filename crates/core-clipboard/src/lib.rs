@@ -276,7 +276,10 @@ pub fn normalize_image_payload(
     if matches!(format, ImageClipboardFormat::Bgra8) {
         let expected = width as usize * height as usize * 4;
         if bytes.len() != expected {
-            anyhow::bail!("BGRA clipboard payload size mismatch: expected {expected}, actual {}", bytes.len());
+            anyhow::bail!(
+                "BGRA clipboard payload size mismatch: expected {expected}, actual {}",
+                bytes.len()
+            );
         }
     }
 
@@ -391,7 +394,10 @@ mod tests {
 
         println!("clipboard sync elapsed: {elapsed:?}");
         assert_eq!(update.update.payload.text, "perf");
-        assert!(elapsed < Duration::from_millis(20), "clipboard sync took {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(20),
+            "clipboard sync took {elapsed:?}"
+        );
     }
 
     #[test]
@@ -400,7 +406,9 @@ mod tests {
             ImageClipboardFormat::Bgra8,
             2,
             2,
-            vec![0, 0, 0, 255, 10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255],
+            vec![
+                0, 0, 0, 255, 10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255,
+            ],
         )
         .expect("normalize image payload");
 

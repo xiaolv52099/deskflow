@@ -162,7 +162,11 @@ pub fn chunk_bytes(
         .iter()
         .any(|candidate| candidate.file_id == file.file_id)
     {
-        anyhow::bail!("file {} is not part of transfer {}", file.file_id, plan.manifest.transfer_id);
+        anyhow::bail!(
+            "file {} is not part of transfer {}",
+            file.file_id,
+            plan.manifest.transfer_id
+        );
     }
     if file.size_bytes != file_bytes.len() as u64 {
         anyhow::bail!(
@@ -238,8 +242,9 @@ impl TransferReceiver {
 
         let mut files = HashMap::new();
         for descriptor in &plan.manifest.files {
-            let size = usize::try_from(descriptor.size_bytes)
-                .map_err(|_| anyhow::anyhow!("file {} exceeds platform capacity", descriptor.file_id))?;
+            let size = usize::try_from(descriptor.size_bytes).map_err(|_| {
+                anyhow::anyhow!("file {} exceeds platform capacity", descriptor.file_id)
+            })?;
             files.insert(
                 descriptor.file_id,
                 FileAssembly {
@@ -390,8 +395,13 @@ mod tests {
     #[test]
     fn approved_plan_tracks_progress_until_completion() {
         let approved = approve_transfer(
-            plan_transfer(Uuid::new_v4(), Uuid::new_v4(), sample_files(), Some(256 * 1024))
-                .expect("plan transfer"),
+            plan_transfer(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                sample_files(),
+                Some(256 * 1024),
+            )
+            .expect("plan transfer"),
         );
         let progress = progress_for_chunk(&approved, 2).expect("progress");
 
@@ -415,7 +425,10 @@ mod tests {
 
         println!("file transfer planning elapsed: {elapsed:?}");
         assert_eq!(plan.status, TransferStatus::PendingApproval);
-        assert!(elapsed < Duration::from_millis(20), "transfer planning took {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(20),
+            "transfer planning took {elapsed:?}"
+        );
     }
 
     #[test]
@@ -429,7 +442,8 @@ mod tests {
         };
         let data = vec![7_u8; file.size_bytes as usize];
         let plan = approve_transfer(
-            plan_transfer(source, target, vec![file.clone()], Some(128 * 1024)).expect("plan transfer"),
+            plan_transfer(source, target, vec![file.clone()], Some(128 * 1024))
+                .expect("plan transfer"),
         );
         let chunks = chunk_bytes(&plan, &file, &data).expect("chunk file");
         let mut receiver = TransferReceiver::new(plan).expect("create receiver");
@@ -447,8 +461,13 @@ mod tests {
     fn multi_file_chunks_can_arrive_out_of_order() {
         let files = sample_files();
         let plan = approve_transfer(
-            plan_transfer(Uuid::new_v4(), Uuid::new_v4(), files.clone(), Some(128 * 1024))
-                .expect("plan transfer"),
+            plan_transfer(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                files.clone(),
+                Some(128 * 1024),
+            )
+            .expect("plan transfer"),
         );
         let mut file_bytes = HashMap::new();
         file_bytes.insert(files[0].file_id, vec![1_u8; files[0].size_bytes as usize]);
@@ -548,8 +567,13 @@ mod tests {
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
         let plan = approve_transfer(
-            plan_transfer(Uuid::new_v4(), Uuid::new_v4(), vec![file.clone()], Some(256 * 1024))
-                .expect("plan transfer"),
+            plan_transfer(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                vec![file.clone()],
+                Some(256 * 1024),
+            )
+            .expect("plan transfer"),
         );
 
         let (completed, elapsed) = transfer_pipeline_latency(|| {

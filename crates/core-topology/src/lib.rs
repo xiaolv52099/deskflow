@@ -96,7 +96,11 @@ impl TopologyLayout {
         device_id: Uuid,
         display_name: impl Into<String>,
     ) -> Result<()> {
-        if self.devices.iter().any(|device| device.device_id == device_id) {
+        if self
+            .devices
+            .iter()
+            .any(|device| device.device_id == device_id)
+        {
             anyhow::bail!("device already exists in topology");
         }
 
@@ -166,7 +170,11 @@ impl TopologyLayout {
     }
 
     pub fn validate(&self) -> Result<()> {
-        ensure_in_bounds(self.grid_width, self.grid_height, GridPosition { x: 0, y: 0 })?;
+        ensure_in_bounds(
+            self.grid_width,
+            self.grid_height,
+            GridPosition { x: 0, y: 0 },
+        )?;
         if self.grid_width <= 0 || self.grid_height <= 0 {
             anyhow::bail!("topology grid dimensions must be positive");
         }
@@ -187,11 +195,9 @@ impl TopologyLayout {
             }
         }
 
-        if !self
-            .devices
-            .iter()
-            .any(|device| device.device_id == self.controller_device_id && device.position.is_some())
-        {
+        if !self.devices.iter().any(|device| {
+            device.device_id == self.controller_device_id && device.position.is_some()
+        }) {
             anyhow::bail!("controller device must be placed");
         }
 
@@ -400,7 +406,9 @@ mod tests {
             .expect("add pending");
 
         assert_eq!(layout.pending_devices().len(), 1);
-        layout.validate().expect("pending does not invalidate layout");
+        layout
+            .validate()
+            .expect("pending does not invalidate layout");
     }
 
     #[test]
@@ -408,7 +416,9 @@ mod tests {
         let controller = Uuid::new_v4();
         let client = Uuid::new_v4();
         let mut layout = TopologyLayout::new(controller, "controller");
-        layout.add_pending_device(client, "client").expect("add pending");
+        layout
+            .add_pending_device(client, "client")
+            .expect("add pending");
         layout
             .place_device(client, GridPosition { x: 2, y: 1 })
             .expect("place client");
@@ -425,7 +435,9 @@ mod tests {
         let controller = Uuid::new_v4();
         let client = Uuid::new_v4();
         let mut layout = TopologyLayout::new(controller, "controller");
-        layout.add_pending_device(client, "client").expect("add pending");
+        layout
+            .add_pending_device(client, "client")
+            .expect("add pending");
         layout.devices.push(TopologyDevice {
             device_id: client,
             display_name: "duplicate".into(),
@@ -476,7 +488,9 @@ mod tests {
         let client = Uuid::new_v4();
         let mut layout =
             load_or_create_topology(&paths, controller, "controller").expect("create topology");
-        layout.add_pending_device(client, "client").expect("add pending");
+        layout
+            .add_pending_device(client, "client")
+            .expect("add pending");
         layout
             .place_device(client, GridPosition { x: 2, y: 1 })
             .expect("place client");
@@ -492,7 +506,9 @@ mod tests {
         let controller = Uuid::new_v4();
         let client = Uuid::new_v4();
         let mut layout = TopologyLayout::new(controller, "controller");
-        layout.add_pending_device(client, "client").expect("add pending");
+        layout
+            .add_pending_device(client, "client")
+            .expect("add pending");
         layout
             .place_device(client, GridPosition { x: 2, y: 1 })
             .expect("place client");
@@ -510,7 +526,9 @@ mod tests {
         let controller = Uuid::new_v4();
         let client = Uuid::new_v4();
         let mut current = TopologyLayout::new(controller, "controller");
-        current.add_pending_device(client, "client").expect("add pending");
+        current
+            .add_pending_device(client, "client")
+            .expect("add pending");
 
         let mut next = current.clone();
         next.place_device(client, GridPosition { x: 2, y: 1 })
@@ -520,7 +538,10 @@ mod tests {
         assert_eq!(update.previous_version, 1);
         assert_eq!(update.next_version, 2);
         assert_eq!(
-            update.layout.neighbor(controller, EdgeDirection::Right).map(|device| device.device_id),
+            update
+                .layout
+                .neighbor(controller, EdgeDirection::Right)
+                .map(|device| device.device_id),
             Some(client)
         );
     }
@@ -530,7 +551,9 @@ mod tests {
         let controller = Uuid::new_v4();
         let client = Uuid::new_v4();
         let mut current = TopologyLayout::new(controller, "controller");
-        current.add_pending_device(client, "client").expect("add pending");
+        current
+            .add_pending_device(client, "client")
+            .expect("add pending");
         let mut next = current.clone();
         next.place_device(client, GridPosition { x: 2, y: 1 })
             .expect("place client");

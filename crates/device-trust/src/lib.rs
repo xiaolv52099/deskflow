@@ -127,9 +127,10 @@ pub fn load_or_create_certificate(
     params
         .distinguished_name
         .push(DnType::OrganizationName, "Deskflow-Plus");
-    params
-        .distinguished_name
-        .push(DnType::OrganizationalUnitName, identity.device_id.to_string());
+    params.distinguished_name.push(
+        DnType::OrganizationalUnitName,
+        identity.device_id.to_string(),
+    );
     let certificate = params
         .self_signed(&key_pair)
         .context("create self-signed device certificate")?;
@@ -191,12 +192,17 @@ pub fn revoke_trusted_device(paths: &AppPaths, device_id: Uuid) -> Result<()> {
     save_trust_store(paths, &trust_store)
 }
 
-pub fn update_trusted_device_last_seen(paths: &AppPaths, device_id: Uuid, seen_at_unix_ms: u128) -> Result<bool> {
+pub fn update_trusted_device_last_seen(
+    paths: &AppPaths,
+    device_id: Uuid,
+    seen_at_unix_ms: u128,
+) -> Result<bool> {
     let mut trust_store = load_trust_store(paths)?;
     let Some(device) = trust_store
         .devices
         .iter_mut()
-        .find(|device| device.device_id == device_id && device.revoked_at_unix_ms.is_none()) else {
+        .find(|device| device.device_id == device_id && device.revoked_at_unix_ms.is_none())
+    else {
         return Ok(false);
     };
     device.last_seen_unix_ms = Some(seen_at_unix_ms);
@@ -288,8 +294,7 @@ mod tests {
         let identity = load_or_create_identity(&paths, "controller").expect("identity");
         let certificate =
             load_or_create_certificate(&paths, &identity).expect("create certificate");
-        let reloaded =
-            load_or_create_certificate(&paths, &identity).expect("reload certificate");
+        let reloaded = load_or_create_certificate(&paths, &identity).expect("reload certificate");
 
         assert_eq!(certificate, reloaded);
         assert_eq!(certificate.subject_device_id, identity.device_id);
@@ -328,7 +333,9 @@ mod tests {
         };
 
         let error = validate_trust(&paths, &identity, &rotated).expect_err("fingerprint mismatch");
-        assert!(error.to_string().contains("certificate fingerprint mismatch"));
+        assert!(error
+            .to_string()
+            .contains("certificate fingerprint mismatch"));
     }
 
     #[test]

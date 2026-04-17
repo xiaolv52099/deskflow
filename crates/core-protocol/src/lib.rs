@@ -112,7 +112,9 @@ pub enum ProtocolMessage {
     Ping,
     Pong,
     Shutdown,
-    Ready { pid: u32 },
+    Ready {
+        pid: u32,
+    },
     DiscoverProbe(DeviceDescriptor),
     DiscoverAnnounce(DeviceDescriptor),
     DiscoverWithdraw {
@@ -152,7 +154,9 @@ pub enum ProtocolMessage {
         transfer_id: Uuid,
         reason: String,
     },
-    Diagnostic { message: String },
+    Diagnostic {
+        message: String,
+    },
 }
 
 impl ProtocolMessage {
@@ -283,8 +287,9 @@ mod tests {
 
     #[test]
     fn protocol_negotiation_succeeds_for_matching_versions() {
-        let agreed = negotiate_protocol(VersionNegotiation::default(), VersionNegotiation::default())
-            .expect("negotiate protocol");
+        let agreed =
+            negotiate_protocol(VersionNegotiation::default(), VersionNegotiation::default())
+                .expect("negotiate protocol");
         assert_eq!(agreed, CURRENT_PROTOCOL_VERSION);
     }
 
@@ -319,7 +324,8 @@ mod tests {
                 address: "192.168.1.20".into(),
                 port: 24800,
                 fingerprint_sha256: "abc123".into(),
-                certificate_pem: "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----".into(),
+                certificate_pem: "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----"
+                    .into(),
             },
             pairing_code: PairingCode {
                 value: "123456".into(),

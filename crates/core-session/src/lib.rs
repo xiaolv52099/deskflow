@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use core_protocol::{DeviceDescriptor, PairingCode, ProtocolMessage};
 use device_trust::{
-    certificate_fingerprint_sha256, load_or_create_certificate, load_or_create_identity, trust_device, validate_trust,
-    DeviceCertificate, DeviceIdentity, TrustedDevice,
+    certificate_fingerprint_sha256, load_or_create_certificate, load_or_create_identity,
+    trust_device, validate_trust, DeviceCertificate, DeviceIdentity, TrustedDevice,
 };
 use foundation::AppPaths;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -238,10 +238,9 @@ pub fn managed_devices_from_trust_store(
         .iter()
         .filter(|device| device.revoked_at_unix_ms.is_none())
         .map(|device| {
-            let status = if device
-                .last_seen_unix_ms
-                .is_some_and(|last_seen| now_unix_ms.saturating_sub(last_seen) <= offline_after_ms as u128)
-            {
+            let status = if device.last_seen_unix_ms.is_some_and(|last_seen| {
+                now_unix_ms.saturating_sub(last_seen) <= offline_after_ms as u128
+            }) {
                 ManagedDeviceStatus::Online
             } else {
                 ManagedDeviceStatus::Offline
@@ -280,7 +279,11 @@ pub fn schedule_device_reconnect(device: &ManagedDevice, attempt: u32) -> Manage
     }
 }
 
-pub fn apply_device_repair(device: &ManagedDevice, action: DeviceRepairAction, now_unix_ms: u128) -> ManagedDevice {
+pub fn apply_device_repair(
+    device: &ManagedDevice,
+    action: DeviceRepairAction,
+    now_unix_ms: u128,
+) -> ManagedDevice {
     match action {
         DeviceRepairAction::MarkOnline => ManagedDevice {
             status: ManagedDeviceStatus::Online,
@@ -317,7 +320,10 @@ pub fn build_server_tls_config(paths: &AppPaths) -> Result<ServerConfig> {
     Ok(config)
 }
 
-pub fn build_client_tls_config(paths: &AppPaths, remote: &DeviceDescriptor) -> Result<ClientConfig> {
+pub fn build_client_tls_config(
+    paths: &AppPaths,
+    remote: &DeviceDescriptor,
+) -> Result<ClientConfig> {
     validate_remote_session(paths, remote)?;
     let mut roots = RootCertStore::empty();
     let remote_cert = pem_to_certificate_der(&remote.certificate_pem)?;
@@ -337,13 +343,9 @@ pub fn bind_discovery_socket() -> Result<UdpSocket> {
     socket
         .set_reuse_address(true)
         .context("enable reuse address")?;
-    socket
-        .set_broadcast(true)
-        .context("enable broadcast")?;
+    socket.set_broadcast(true).context("enable broadcast")?;
     let addr = SocketAddr::from(([0, 0, 0, 0], DISCOVERY_PORT));
-    socket
-        .bind(&addr.into())
-        .context("bind discovery socket")?;
+    socket.bind(&addr.into()).context("bind discovery socket")?;
     Ok(socket.into())
 }
 
@@ -362,7 +364,9 @@ fn pem_to_private_key_der(pem: &str) -> Result<PrivateKeyDer<'static>> {
         .map_err(|error| anyhow::anyhow!("read private key pem: {error:?}"))?
         .context("missing private key pem block")?;
     match item {
-        rustls_pemfile::Item::Pkcs8Key(key) => Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.secret_pkcs8_der().to_vec()))),
+        rustls_pemfile::Item::Pkcs8Key(key) => Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            key.secret_pkcs8_der().to_vec(),
+        ))),
         other => anyhow::bail!("unexpected pem item for private key: {other:?}"),
     }
 }
@@ -370,7 +374,9 @@ fn pem_to_private_key_der(pem: &str) -> Result<PrivateKeyDer<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use device_trust::{load_or_create_certificate, load_or_create_identity, revoke_trusted_device};
+    use device_trust::{
+        load_or_create_certificate, load_or_create_identity, revoke_trusted_device,
+    };
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -393,8 +399,7 @@ mod tests {
         endpoint: &ManualEndpoint,
     ) -> (DeviceIdentity, DeviceCertificate, DeviceDescriptor) {
         let identity = load_or_create_identity(paths, display_name).expect("identity");
-        let certificate =
-            load_or_create_certificate(paths, &identity).expect("certificate");
+        let certificate = load_or_create_certificate(paths, &identity).expect("certificate");
         let descriptor = session_descriptor(&identity, &certificate, endpoint);
         (identity, certificate, descriptor)
     }
@@ -588,7 +593,10 @@ mod tests {
 
         let reconnecting = schedule_device_reconnect(&device, 2);
         assert_eq!(reconnecting.status, ManagedDeviceStatus::Reconnecting);
-        assert_eq!(reconnecting.next_retry_after_ms, DEFAULT_RECONNECT_BACKOFF_MS * 2);
+        assert_eq!(
+            reconnecting.next_retry_after_ms,
+            DEFAULT_RECONNECT_BACKOFF_MS * 2
+        );
 
         let repaired = apply_device_repair(&reconnecting, DeviceRepairAction::MarkOnline, 12_000);
         assert_eq!(repaired.status, ManagedDeviceStatus::Online);
@@ -682,8 +690,11 @@ mod tests {
         )
         .expect("client trusts server");
 
-        let server_config = Arc::new(build_server_tls_config(&server_paths).expect("server tls config"));
-        let client_config = Arc::new(build_client_tls_config(&client_paths, &server_descriptor).expect("client tls config"));
+        let server_config =
+            Arc::new(build_server_tls_config(&server_paths).expect("server tls config"));
+        let client_config = Arc::new(
+            build_client_tls_config(&client_paths, &server_descriptor).expect("client tls config"),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp listener");
         let addr = listener.local_addr().expect("listener addr");
 
@@ -718,7 +729,10 @@ mod tests {
         let elapsed = started.elapsed();
         println!("rustls loopback session elapsed: {elapsed:?}");
 
-        server_task.join().expect("server task").expect("server result");
+        server_task
+            .join()
+            .expect("server task")
+            .expect("server result");
 
         let _ = (client_identity, client_certificate);
     }

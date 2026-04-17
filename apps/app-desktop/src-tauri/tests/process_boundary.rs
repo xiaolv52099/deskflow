@@ -1,8 +1,8 @@
 use anyhow::Result;
 use core_protocol::CURRENT_PROTOCOL_VERSION;
 use foundation::DATA_ROOT_ENV_VAR;
-use std::fs;
 use local_ipc::{core_service_bin, send_command, CoreToUiEvent, UiToCoreCommand};
+use std::fs;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 
@@ -44,7 +44,9 @@ async fn desktop_shell_can_ping_and_shutdown_core_service() -> Result<()> {
 
     let ready = wait_until_ready().await?;
     match ready {
-        CoreToUiEvent::Ready { protocol_version, .. } => {
+        CoreToUiEvent::Ready {
+            protocol_version, ..
+        } => {
             assert_eq!(protocol_version, CURRENT_PROTOCOL_VERSION);
         }
         other => panic!("unexpected event: {other:?}"),

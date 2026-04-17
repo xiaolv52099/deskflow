@@ -6,11 +6,15 @@ use core_session::{
     session_descriptor, PairingDecision, PairingRequest, DISCOVERY_PORT, SESSION_PORT,
 };
 use core_topology::load_or_create_topology;
-use device_trust::{default_display_name, load_or_create_certificate, load_or_create_identity, update_trusted_device_last_seen};
+use device_trust::{
+    default_display_name, load_or_create_certificate, load_or_create_identity,
+    update_trusted_device_last_seen,
+};
 use foundation::{
-    append_log, export_diagnostic_snapshot, init_tracing, load_discovery_peers, load_or_create_config,
-    load_pending_pairing_requests, save_discovery_peers, save_pending_pairing_requests, upsert_cached_peer_descriptor,
-    AppPaths, CachedPeerDescriptor, DiscoveryPeer, PendingPairingRequest,
+    append_log, export_diagnostic_snapshot, init_tracing, load_discovery_peers,
+    load_or_create_config, load_pending_pairing_requests, save_discovery_peers,
+    save_pending_pairing_requests, upsert_cached_peer_descriptor, AppPaths, CachedPeerDescriptor,
+    DiscoveryPeer, PendingPairingRequest,
 };
 use local_ipc::bind_listener;
 use serde::{Deserialize, Serialize};
@@ -27,6 +31,8 @@ use tracing::info;
 use uuid::Uuid;
 
 const DISCOVERY_PEER_TTL_MS: u128 = 8_000;
+const MAX_TRANSFER_SESSION_HEADER_BYTES: u64 = 512 * 1024;
+const MAX_TRANSFER_CHUNK_HEADER_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -86,6 +92,9 @@ fn persist_transfer_stream(
         if chunk_header_len == 0 {
             break;
         }
+        if chunk_header_len > MAX_TRANSFER_CHUNK_HEADER_BYTES {
+            anyhow::bail!("invalid transfer chunk header length: {chunk_header_len}");
+        }
 
         let mut chunk_header_raw = vec![0u8; chunk_header_len as usize];
         tls.read_exact(&mut chunk_header_raw)
@@ -109,7 +118,10 @@ fn persist_transfer_stream(
             .context("read transfer chunk payload")?;
         let actual_checksum = checksum_sha256(&chunk_bytes);
         if actual_checksum != chunk_header.checksum_sha256 {
-            anyhow::bail!("transfer chunk checksum mismatch for {}", chunk_header.file_id);
+            anyhow::bail!(
+                "transfer chunk checksum mismatch for {}",
+                chunk_header.file_id
+            );
         }
 
         let file_path = transfer_dir.join(&chunk_header.file_name);
@@ -135,7 +147,8 @@ fn persist_transfer_stream(
         writer
             .write_all(&chunk_bytes)
             .with_context(|| format!("write received transfer file {}", file_path.display()))?;
-        transferred_bytes = (transferred_bytes + chunk_header.size_bytes).min(record.plan.manifest.total_bytes);
+        transferred_bytes =
+            (transferred_bytes + chunk_header.size_bytes).min(record.plan.manifest.total_bytes);
         if chunk_header.is_last_chunk {
             writer
                 .flush()
@@ -310,7 +323,8 @@ fn prepare_discovery_socket() -> Result<UdpSocket> {
     socket
         .set_nonblocking(true)
         .map_err(|error| anyhow::anyhow!("set discovery socket nonblocking: {error}"))?;
-    UdpSocket::from_std(socket).map_err(|error| anyhow::anyhow!("create tokio discovery socket: {error}"))
+    UdpSocket::from_std(socket)
+        .map_err(|error| anyhow::anyhow!("create tokio discovery socket: {error}"))
 }
 
 async fn run_discovery_loop(
@@ -323,10 +337,10 @@ async fn run_discovery_loop(
         .into_iter()
         .map(|peer| (peer.device_id.clone(), peer))
         .collect();
-    let announce = ProtocolFrame::new(ProtocolMessage::DiscoverAnnounce(device.clone()))
-        .encode_json_line()?;
-    let probe = ProtocolFrame::new(ProtocolMessage::DiscoverProbe(device.clone()))
-        .encode_json_line()?;
+    let announce =
+        ProtocolFrame::new(ProtocolMessage::DiscoverAnnounce(device.clone())).encode_json_line()?;
+    let probe =
+        ProtocolFrame::new(ProtocolMessage::DiscoverProbe(device.clone())).encode_json_line()?;
     let broadcast_addr = format!("255.255.255.255:{DISCOVERY_PORT}");
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     let mut buffer = vec![0_u8; 16 * 1024];
@@ -574,19 +588,22 @@ fn run_transfer_listener(listener: TcpListener, paths: AppPaths) -> Result<()> {
     }
 }
 
-fn handle_transfer_connection(
-    stream: std::net::TcpStream,
-    paths: &AppPaths,
-) -> Result<()> {
+fn handle_transfer_connection(stream: std::net::TcpStream, paths: &AppPaths) -> Result<()> {
     let server_config = Arc::new(build_server_tls_config(paths)?);
-    let connection = rustls::ServerConnection::new(server_config).context("create transfer server tls connection")?;
+    let connection = rustls::ServerConnection::new(server_config)
+        .context("create transfer server tls connection")?;
     let mut tls = rustls::StreamOwned::new(connection, stream);
 
     let mut length_bytes = [0u8; 8];
-    tls.read_exact(&mut length_bytes).context("read transfer session header length")?;
+    tls.read_exact(&mut length_bytes)
+        .context("read transfer session header length")?;
     let payload_len = u64::from_be_bytes(length_bytes);
+    if payload_len == 0 || payload_len > MAX_TRANSFER_SESSION_HEADER_BYTES {
+        anyhow::bail!("invalid transfer session header length: {payload_len}");
+    }
     let mut payload = vec![0u8; payload_len as usize];
-    tls.read_exact(&mut payload).context("read transfer session header body")?;
+    tls.read_exact(&mut payload)
+        .context("read transfer session header body")?;
 
     let session: TransferSessionHeader =
         serde_json::from_slice(&payload).context("parse received transfer session header")?;
@@ -601,7 +618,10 @@ fn handle_transfer_connection(
 }
 
 #[allow(dead_code)]
-fn persist_transfer_artifacts(paths: &AppPaths, artifact: &TransferArtifactPayload) -> Result<TransferDeliveryAck> {
+fn persist_transfer_artifacts(
+    paths: &AppPaths,
+    artifact: &TransferArtifactPayload,
+) -> Result<TransferDeliveryAck> {
     paths.ensure_layout()?;
     let identity = load_or_create_identity(paths, &default_display_name())?;
     let transfer_dir = paths

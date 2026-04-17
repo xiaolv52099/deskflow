@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 
 export interface GridPositionDto {
   x: number;
@@ -253,8 +254,20 @@ export async function repairManagedDevice(device_id: string, action: "mark_onlin
   });
 }
 
+export async function describeTransferFiles(paths: string[]) {
+  return invoke<SelectedTransferFileDto[]>("describe_transfer_files", { paths });
+}
+
 export async function selectTransferFiles() {
-  return invoke<SelectedTransferFileDto[]>("select_transfer_files");
+  const selected = await open({
+    directory: false,
+    multiple: true,
+    title: "选择要发送的文件",
+  });
+  if (!selected) return [];
+  const paths = Array.isArray(selected) ? selected : [selected];
+  if (!paths.length) return [];
+  return describeTransferFiles(paths);
 }
 
 export async function createTransferPlan(target_device_id: string, files: { name: string; path: string; size_bytes: number }[]) {
