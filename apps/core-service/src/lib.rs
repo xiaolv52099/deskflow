@@ -87,7 +87,6 @@ pub async fn run_core_service() -> Result<()> {
     let certificate = load_or_create_certificate(&paths, &identity)?;
     let endpoint = manual_endpoint(detect_local_host_ip(), SESSION_PORT);
     let session_device = session_descriptor(&identity, &certificate, &endpoint);
-    let _session_tls = build_server_tls_config(&paths)?;
     let topology = load_or_create_topology(&paths, identity.device_id, &identity.display_name)?;
     let diagnostic = export_diagnostic_snapshot(&paths, &config)?;
 
@@ -402,11 +401,10 @@ fn default_delivery_state() -> String {
 }
 
 fn run_transfer_listener(listener: TcpListener, paths: AppPaths) -> Result<()> {
-    let server_config = Arc::new(build_server_tls_config(&paths)?);
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
-                if let Err(error) = handle_transfer_connection(stream, Arc::clone(&server_config), &paths) {
+                if let Err(error) = handle_transfer_connection(stream, &paths) {
                     tracing::error!(?error, "handle transfer connection failed");
                 }
             }
@@ -420,9 +418,9 @@ fn run_transfer_listener(listener: TcpListener, paths: AppPaths) -> Result<()> {
 
 fn handle_transfer_connection(
     stream: std::net::TcpStream,
-    server_config: Arc<rustls::ServerConfig>,
     paths: &AppPaths,
 ) -> Result<()> {
+    let server_config = Arc::new(build_server_tls_config(paths)?);
     let connection = rustls::ServerConnection::new(server_config).context("create transfer server tls connection")?;
     let mut tls = rustls::StreamOwned::new(connection, stream);
 

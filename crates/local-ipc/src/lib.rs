@@ -2,6 +2,7 @@ use core_protocol::{ProtocolFrame, ProtocolMessage, VersionNegotiation};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::{timeout, Duration};
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:45821";
 
@@ -35,23 +36,35 @@ pub fn core_service_bin(root: &Path) -> PathBuf {
 }
 
 pub async fn send_command(command: UiToCoreCommand) -> anyhow::Result<CoreToUiEvent> {
-    let stream = TcpStream::connect(core_service_addr()).await?;
+    let stream = timeout(Duration::from_millis(300), TcpStream::connect(core_service_addr()))
+        .await
+        .map_err(|_| anyhow::anyhow!("connect to core-service timed out"))??;
     let (reader, mut writer) = stream.into_split();
 
     let hello = ProtocolFrame::new(ProtocolMessage::VersionHello(VersionNegotiation::default()));
-    writer.write_all(&hello.encode_json_line()?).await?;
-    writer.flush().await?;
+    timeout(Duration::from_millis(300), writer.write_all(&hello.encode_json_line()?))
+        .await
+        .map_err(|_| anyhow::anyhow!("write hello to core-service timed out"))??;
+    timeout(Duration::from_millis(300), writer.flush())
+        .await
+        .map_err(|_| anyhow::anyhow!("flush hello to core-service timed out"))??;
 
     let protocol_message = match command {
         UiToCoreCommand::Ping => ProtocolMessage::Ping,
         UiToCoreCommand::Shutdown => ProtocolMessage::Shutdown,
     };
     let payload = ProtocolFrame::new(protocol_message);
-    writer.write_all(&payload.encode_json_line()?).await?;
-    writer.flush().await?;
+    timeout(Duration::from_millis(300), writer.write_all(&payload.encode_json_line()?))
+        .await
+        .map_err(|_| anyhow::anyhow!("write command to core-service timed out"))??;
+    timeout(Duration::from_millis(300), writer.flush())
+        .await
+        .map_err(|_| anyhow::anyhow!("flush command to core-service timed out"))??;
 
     let mut lines = BufReader::new(reader).lines();
-    let Some(hello_ack_line) = lines.next_line().await? else {
+    let Some(hello_ack_line) = timeout(Duration::from_millis(300), lines.next_line())
+        .await
+        .map_err(|_| anyhow::anyhow!("read version acknowledgement from core-service timed out"))?? else {
         anyhow::bail!("core-service closed connection before version acknowledgement");
     };
     let hello_ack = ProtocolFrame::decode_json_line(hello_ack_line.as_bytes())?;
@@ -59,7 +72,9 @@ pub async fn send_command(command: UiToCoreCommand) -> anyhow::Result<CoreToUiEv
         anyhow::bail!("core-service returned unexpected handshake frame");
     };
 
-    let Some(line) = lines.next_line().await? else {
+    let Some(line) = timeout(Duration::from_millis(300), lines.next_line())
+        .await
+        .map_err(|_| anyhow::anyhow!("read command response from core-service timed out"))?? else {
         anyhow::bail!("core-service closed connection without response");
     };
 

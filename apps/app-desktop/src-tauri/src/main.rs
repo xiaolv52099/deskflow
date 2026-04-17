@@ -522,7 +522,7 @@ fn initialize_app_state() -> Result<AppState> {
         DEFAULT_OFFLINE_AFTER_MS,
     );
     let boot_error = Arc::new(Mutex::new(None));
-    let (owns_core_service, join) = match runtime.block_on(wait_until_ready()) {
+    let (owns_core_service, join) = match runtime.block_on(wait_until_ready_with_retry(2, 50)) {
         Ok(_) => (false, None),
         Err(_) => {
             let boot_error_thread = Arc::clone(&boot_error);
@@ -549,7 +549,7 @@ fn initialize_app_state() -> Result<AppState> {
             (true, Some(join))
         }
     };
-    let protocol_version = match runtime.block_on(wait_until_ready()) {
+    let protocol_version = match runtime.block_on(wait_until_ready_with_retry(40, 100)) {
         Ok(CoreToUiEvent::Ready { protocol_version, .. }) => protocol_version,
         Ok(other) => {
             if let Ok(mut slot) = boot_error.lock() {
@@ -558,6 +558,10 @@ fn initialize_app_state() -> Result<AppState> {
             core_protocol::CURRENT_PROTOCOL_VERSION
         }
         Err(error) => {
+            let _ = append_log(
+                &paths,
+                &format!("core-service readiness failed during app startup: {error:#}"),
+            );
             if let Ok(mut slot) = boot_error.lock() {
                 *slot = Some(format!("{error:#}"));
             }
@@ -608,10 +612,14 @@ fn initialize_app_state() -> Result<AppState> {
 }
 
 async fn wait_until_ready() -> Result<CoreToUiEvent> {
-    for _ in 0..20 {
+    wait_until_ready_with_retry(20, 100).await
+}
+
+async fn wait_until_ready_with_retry(attempts: usize, delay_ms: u64) -> Result<CoreToUiEvent> {
+    for _ in 0..attempts {
         match send_command(UiToCoreCommand::Ping).await {
             Ok(event) => return Ok(event),
-            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await,
         }
     }
 
