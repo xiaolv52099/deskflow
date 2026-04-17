@@ -113,7 +113,11 @@ pub enum ProtocolMessage {
     Pong,
     Shutdown,
     Ready { pid: u32 },
+    DiscoverProbe(DeviceDescriptor),
     DiscoverAnnounce(DeviceDescriptor),
+    DiscoverWithdraw {
+        device_id: String,
+    },
     PairRequest {
         device: DeviceDescriptor,
         pairing_code: PairingCode,
@@ -159,7 +163,9 @@ impl ProtocolMessage {
             ProtocolMessage::Pong => ChannelKind::Control,
             ProtocolMessage::Shutdown => ChannelKind::Control,
             ProtocolMessage::Ready { .. } => ChannelKind::Control,
+            ProtocolMessage::DiscoverProbe(_) => ChannelKind::Control,
             ProtocolMessage::DiscoverAnnounce(_) => ChannelKind::Control,
+            ProtocolMessage::DiscoverWithdraw { .. } => ChannelKind::Control,
             ProtocolMessage::PairRequest { .. } => ChannelKind::Control,
             ProtocolMessage::PairAccept { .. } => ChannelKind::Control,
             ProtocolMessage::PairReject { .. } => ChannelKind::Control,

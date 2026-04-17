@@ -1,8 +1,8 @@
 use anyhow::Result;
 use core_protocol::{negotiate_protocol, ProtocolFrame, ProtocolMessage, VersionNegotiation};
 use core_session::{
-    bind_discovery_socket, build_server_tls_config, manual_endpoint, session_descriptor,
-    DISCOVERY_PORT, SESSION_PORT,
+    bind_discovery_socket, build_server_tls_config, manual_endpoint, process_pairing_request,
+    session_descriptor, PairingDecision, PairingRequest, DISCOVERY_PORT, SESSION_PORT,
 };
 use core_topology::load_or_create_topology;
 use device_trust::{default_display_name, load_or_create_certificate, load_or_create_identity};
@@ -123,6 +123,8 @@ async fn run_discovery_loop(
         .collect();
     let announce = ProtocolFrame::new(ProtocolMessage::DiscoverAnnounce(device.clone()))
         .encode_json_line()?;
+    let probe = ProtocolFrame::new(ProtocolMessage::DiscoverProbe(device.clone()))
+        .encode_json_line()?;
     let broadcast_addr = format!("255.255.255.255:{DISCOVERY_PORT}");
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     let mut buffer = vec![0_u8; 16 * 1024];
@@ -141,6 +143,9 @@ async fn run_discovery_loop(
                 });
                 save_discovery_peers(&paths, &peers.values().cloned().collect::<Vec<_>>())?;
                 if let Ok(config) = load_or_create_config(&paths) {
+                    if config.auto_discovery_enabled {
+                        let _ = socket.send_to(&probe, &broadcast_addr).await;
+                    }
                     if config.app_role == "controller" && config.controller_service_enabled {
                         let _ = socket.send_to(&announce, &broadcast_addr).await;
                     }
@@ -153,6 +158,16 @@ async fn run_discovery_loop(
                     Err(_) => continue,
                 };
                 match frame.message {
+                    ProtocolMessage::DiscoverProbe(remote) => {
+                        if remote.device_id == device.device_id {
+                            continue;
+                        }
+                        if let Ok(config) = load_or_create_config(&paths) {
+                            if config.app_role == "controller" && config.controller_service_enabled {
+                                let _ = socket.send_to(&announce, &addr).await;
+                            }
+                        }
+                    }
                     ProtocolMessage::DiscoverAnnounce(remote) => {
                         if remote.device_id == device.device_id {
                             continue;
@@ -170,6 +185,10 @@ async fn run_discovery_loop(
                                 discovered_at_unix_ms: unix_time_now_ms(),
                             },
                         );
+                        save_discovery_peers(&paths, &peers.values().cloned().collect::<Vec<_>>())?;
+                    }
+                    ProtocolMessage::DiscoverWithdraw { device_id } => {
+                        peers.remove(&device_id);
                         save_discovery_peers(&paths, &peers.values().cloned().collect::<Vec<_>>())?;
                     }
                     ProtocolMessage::PairRequest { device, pairing_code } => {
@@ -193,6 +212,35 @@ async fn run_discovery_loop(
                                 });
                                 save_pending_pairing_requests(&paths, &requests)?;
                             }
+                        }
+                    }
+                    ProtocolMessage::PairAccept { device_id } => {
+                        if device_id == device.device_id {
+                            continue;
+                        }
+                        if let Ok(peer) = load_discovery_peers(&paths)?
+                            .into_iter()
+                            .find(|peer| peer.device_id == device_id)
+                            .ok_or_else(|| anyhow::anyhow!("accepted peer not found in discovery snapshot"))
+                        {
+                            let pairing_request = PairingRequest {
+                                requester: discovery_peer_to_descriptor(&peer),
+                                pairing_code: core_protocol::PairingCode {
+                                    value: format!("auto:accepted:{}", unix_time_now_ms()),
+                                },
+                            };
+                            process_pairing_request(&paths, pairing_request, PairingDecision::Accept)?;
+                            let mut config = load_or_create_config(&paths)?;
+                            config.app_role = "client".into();
+                            config.active_peer_device_id = Some(peer.device_id);
+                            foundation::save_config(&paths, &config)?;
+                        }
+                    }
+                    ProtocolMessage::PairReject { device_id, .. } => {
+                        let mut config = load_or_create_config(&paths)?;
+                        if config.active_peer_device_id.as_deref() == Some(device_id.as_str()) {
+                            config.active_peer_device_id = None;
+                            foundation::save_config(&paths, &config)?;
                         }
                     }
                     _ => {}
@@ -258,4 +306,16 @@ fn unix_time_now_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system time before unix epoch")
         .as_millis()
+}
+
+fn discovery_peer_to_descriptor(peer: &DiscoveryPeer) -> core_protocol::DeviceDescriptor {
+    core_protocol::DeviceDescriptor {
+        device_id: peer.device_id.clone(),
+        display_name: peer.display_name.clone(),
+        platform: peer.platform.clone(),
+        address: peer.address.clone(),
+        port: peer.port,
+        fingerprint_sha256: peer.fingerprint_sha256.clone(),
+        certificate_pem: peer.certificate_pem.clone(),
+    }
 }

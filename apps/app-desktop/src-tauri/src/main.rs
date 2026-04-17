@@ -94,6 +94,7 @@ struct ConnectionStateDto {
     current_pairing_code: Option<String>,
     active_peer_device_id: Option<String>,
     active_peer_display_name: Option<String>,
+    active_peer_state: String,
     pending_pairing_requests: Vec<PendingPairingRequestDto>,
 }
 
@@ -710,6 +711,7 @@ fn get_connection_state(state: tauri::State<'_, AppState>) -> Result<ConnectionS
         *config_slot = config.clone();
     }
     let trust_store = load_trust_store(&state.data_paths).map_err(|error| error.to_string())?;
+    let discovery_peers = load_discovery_peers(&state.data_paths).map_err(|error| error.to_string())?;
     let managed = managed_devices_from_trust_store(
         &trust_store,
         unix_time_now_ms(),
@@ -722,11 +724,29 @@ fn get_connection_state(state: tauri::State<'_, AppState>) -> Result<ConnectionS
             .map_err(|_| "failed to access managed devices".to_string())?;
         *managed_slot = managed.clone();
     }
+    let active_peer_state = if let Some(device_id) = config.active_peer_device_id.as_ref() {
+        if managed
+            .iter()
+            .any(|device| device.device_id.to_string() == *device_id)
+        {
+            "connected"
+        } else {
+            "pending"
+        }
+    } else {
+        "disconnected"
+    };
     let active_peer_display_name = config.active_peer_device_id.as_ref().and_then(|device_id| {
         managed
             .iter()
             .find(|device| device.device_id.to_string() == *device_id)
             .map(|device| device.display_name.clone())
+            .or_else(|| {
+                discovery_peers
+                    .iter()
+                    .find(|peer| peer.device_id == *device_id)
+                    .map(|peer| peer.display_name.clone())
+            })
     });
     let pending = load_pending_pairing_requests(&state.data_paths)
         .map_err(|error| error.to_string())?
@@ -748,6 +768,7 @@ fn get_connection_state(state: tauri::State<'_, AppState>) -> Result<ConnectionS
         current_pairing_code: config.current_pairing_code,
         active_peer_device_id: config.active_peer_device_id,
         active_peer_display_name,
+        active_peer_state: active_peer_state.into(),
         pending_pairing_requests: pending,
     })
 }
@@ -822,6 +843,16 @@ fn set_controller_service_enabled(
     }
     if !enabled {
         save_discovery_peers(&state.data_paths, &[]).map_err(|error| error.to_string())?;
+        let identity = load_or_create_identity(&state.data_paths, &default_display_name())
+            .map_err(|error| error.to_string())?;
+        let frame = core_protocol::ProtocolFrame::new(core_protocol::ProtocolMessage::DiscoverWithdraw {
+            device_id: identity.device_id.to_string(),
+        })
+        .encode_json_line()
+        .map_err(|error| error.to_string())?;
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|error| error.to_string())?;
+        let _ = socket.set_broadcast(true);
+        let _ = socket.send_to(&frame, format!("255.255.255.255:{DISCOVERY_PORT}"));
     }
 
     {
@@ -983,6 +1014,26 @@ fn respond_to_pending_pairing(
                 .map_err(|_| "failed to access app health".to_string())?;
             health.active_peer_device_id = Some(target.device_id.clone());
         }
+        let frame = core_protocol::ProtocolFrame::new(core_protocol::ProtocolMessage::PairAccept {
+            device_id: local_identity.device_id.to_string(),
+        })
+        .encode_json_line()
+        .map_err(|error| error.to_string())?;
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|error| error.to_string())?;
+        socket
+            .send_to(&frame, format!("{}:{}", target.address, DISCOVERY_PORT))
+            .map_err(|error| error.to_string())?;
+    } else {
+        let frame = core_protocol::ProtocolFrame::new(core_protocol::ProtocolMessage::PairReject {
+            device_id: local_identity.device_id.to_string(),
+            reason: "rejected".into(),
+        })
+        .encode_json_line()
+        .map_err(|error| error.to_string())?;
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|error| error.to_string())?;
+        socket
+            .send_to(&frame, format!("{}:{}", target.address, DISCOVERY_PORT))
+            .map_err(|error| error.to_string())?;
     }
 
     get_device_management_snapshot(state.clone())?;
