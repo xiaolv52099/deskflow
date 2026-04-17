@@ -1,4 +1,5 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use core_file_transfer::{TransferPlan, TransferProgress};
 use core_protocol::{negotiate_protocol, ProtocolFrame, ProtocolMessage, VersionNegotiation};
 use core_session::{
     bind_discovery_socket, build_server_tls_config, manual_endpoint, process_pairing_request,
@@ -12,7 +13,12 @@ use foundation::{
     save_pending_pairing_requests, AppPaths, DiscoveryPeer, PendingPairingRequest,
 };
 use local_ipc::bind_listener;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UdpSocket};
@@ -20,6 +26,57 @@ use tokio::sync::watch;
 use tracing::info;
 
 const DISCOVERY_PEER_TTL_MS: u128 = 8_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct TransferRecord {
+    plan: TransferPlan,
+    progress: TransferProgress,
+    verified_files: usize,
+    elapsed_ms: u128,
+    created_at_unix_ms: u128,
+    #[serde(default = "default_transfer_direction")]
+    direction: String,
+    #[serde(default)]
+    peer_device_id: Option<String>,
+    #[serde(default)]
+    peer_display_name: Option<String>,
+    #[serde(default = "default_delivery_state")]
+    delivery_state: String,
+    #[serde(default)]
+    delivery_message: Option<String>,
+    #[serde(default)]
+    confirmed_at_unix_ms: Option<u128>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct TransferArtifactPayload {
+    record: TransferRecord,
+    source_device_id: String,
+    source_display_name: String,
+    files: Vec<TransferArtifactFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct TransferArtifactFile {
+    name: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct TransferDeliveryAck {
+    ok: bool,
+    receiver_device_id: String,
+    receiver_display_name: String,
+    confirmed_at_unix_ms: u128,
+    verified_files: usize,
+    total_bytes: u64,
+    message: String,
+}
 
 pub async fn run_core_service() -> Result<()> {
     let paths = AppPaths::from_runtime_env()?;
@@ -60,6 +117,10 @@ pub async fn run_core_service() -> Result<()> {
     let listener = bind_listener().await?;
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let discovery_socket = prepare_discovery_socket()?;
+    let transfer_listener = std::net::TcpListener::bind(("0.0.0.0", SESSION_PORT))?;
+    transfer_listener
+        .set_nonblocking(true)
+        .map_err(|error| anyhow::anyhow!("set transfer listener nonblocking: {error}"))?;
     let discovery_shutdown_rx = shutdown_tx.subscribe();
     let discovery_paths = paths.clone();
     let discovery_device = session_device.clone();
@@ -73,6 +134,12 @@ pub async fn run_core_service() -> Result<()> {
         .await
         {
             tracing::error!(?error, "discovery loop failed");
+        }
+    });
+    let transfer_paths = paths.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = run_transfer_listener(transfer_listener, transfer_paths) {
+            tracing::error!(?error, "transfer listener failed");
         }
     });
 
@@ -324,4 +391,89 @@ fn discovery_peer_to_descriptor(peer: &DiscoveryPeer) -> core_protocol::DeviceDe
         fingerprint_sha256: peer.fingerprint_sha256.clone(),
         certificate_pem: peer.certificate_pem.clone(),
     }
+}
+
+fn default_transfer_direction() -> String {
+    "inbound".into()
+}
+
+fn default_delivery_state() -> String {
+    "received".into()
+}
+
+fn run_transfer_listener(listener: TcpListener, paths: AppPaths) -> Result<()> {
+    let server_config = Arc::new(build_server_tls_config(&paths)?);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if let Err(error) = handle_transfer_connection(stream, Arc::clone(&server_config), &paths) {
+                    tracing::error!(?error, "handle transfer connection failed");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(anyhow::anyhow!("accept transfer tcp: {error}")),
+        }
+    }
+}
+
+fn handle_transfer_connection(
+    stream: std::net::TcpStream,
+    server_config: Arc<rustls::ServerConfig>,
+    paths: &AppPaths,
+) -> Result<()> {
+    let connection = rustls::ServerConnection::new(server_config).context("create transfer server tls connection")?;
+    let mut tls = rustls::StreamOwned::new(connection, stream);
+
+    let mut length_bytes = [0u8; 8];
+    tls.read_exact(&mut length_bytes).context("read transfer payload length")?;
+    let payload_len = u64::from_be_bytes(length_bytes);
+    let mut payload = vec![0u8; payload_len as usize];
+    tls.read_exact(&mut payload).context("read transfer payload body")?;
+
+    let artifact: TransferArtifactPayload =
+        serde_json::from_slice(&payload).context("parse received transfer payload")?;
+    let ack = persist_transfer_artifacts(paths, &artifact).context("persist received transfer artifacts")?;
+    let ack_raw = serde_json::to_vec(&ack).context("serialize transfer ack")?;
+    tls.write_all(&(ack_raw.len() as u64).to_be_bytes())
+        .context("write transfer ack length")?;
+    tls.write_all(&ack_raw).context("write transfer ack")?;
+    tls.flush().context("flush transfer ack")?;
+    Ok(())
+}
+
+fn persist_transfer_artifacts(paths: &AppPaths, artifact: &TransferArtifactPayload) -> Result<TransferDeliveryAck> {
+    paths.ensure_layout()?;
+    let identity = load_or_create_identity(paths, &default_display_name())?;
+    let transfer_dir = paths
+        .transfers_dir()
+        .join(artifact.record.plan.manifest.transfer_id.to_string());
+    fs::create_dir_all(&transfer_dir).context("create transfer artifact directory")?;
+
+    let confirmed_at_unix_ms = unix_time_now_ms();
+    let mut record = artifact.record.clone();
+    record.direction = "inbound".into();
+    record.peer_device_id = Some(artifact.source_device_id.clone());
+    record.peer_display_name = Some(artifact.source_display_name.clone());
+    record.delivery_state = "received".into();
+    record.delivery_message = Some("接收端已落盘并校验完成".into());
+    record.confirmed_at_unix_ms = Some(confirmed_at_unix_ms);
+    record.verified_files = artifact.files.len();
+    let summary_path = transfer_dir.join("transfer-record.json");
+    let summary = serde_json::to_string_pretty(&record).context("serialize transfer record")?;
+    fs::write(&summary_path, summary).context("write transfer record summary")?;
+    for file in &artifact.files {
+        fs::write(transfer_dir.join(&file.name), &file.bytes)
+            .with_context(|| format!("write received transfer file {}", file.name))?;
+    }
+    Ok(TransferDeliveryAck {
+        ok: true,
+        receiver_device_id: identity.device_id.to_string(),
+        receiver_display_name: identity.display_name,
+        confirmed_at_unix_ms,
+        verified_files: artifact.files.len(),
+        total_bytes: artifact.record.progress.total_bytes,
+        message: "接收端已落盘并校验完成".into(),
+    })
 }

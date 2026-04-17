@@ -1,21 +1,27 @@
-import { useEffect, useRef, useState } from "react";
-import {
-  Download,
-  FileText,
-  FolderOpen,
-  Image as ImageIcon,
-  Monitor,
-  MonitorSmartphone,
-  Paperclip,
-  RefreshCw,
-  Send,
-  Upload,
-} from "lucide-react";
-import { createTransferPlan, getDeviceManagementSnapshot, listTransferPlans, type TransferRecord } from "../lib/tauri";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Check, Copy, File, FileArchive, FileImage, FileSpreadsheet, FileText, FolderOpen, Paperclip, RefreshCw, Send, Upload } from "lucide-react";
+import { createTransferPlan, getConnectionState, getDeviceManagementSnapshot, getTransferArtifactPath, listTransferPlans, revealTransferArtifactLocation, type ConnectionStateDto, type DeviceManagementSnapshot, type TransferRecord } from "../lib/tauri";
 
 interface PendingFile {
   name: string;
   size_bytes: number;
+  file: File;
+}
+
+interface TransferRow {
+  transfer_id: string;
+  created_at_unix_ms: number;
+  confirmed_at_unix_ms?: number | null;
+  elapsed_ms: number;
+  status: string;
+  delivery_state: string;
+  delivery_message?: string | null;
+  direction: string;
+  peer_display_name?: string | null;
+  verified_files: number;
+  total_bytes: number;
+  file_name: string;
+  file_size_bytes: number;
 }
 
 function formatBytes(size: number) {
@@ -23,6 +29,11 @@ function formatBytes(size: number) {
   if (size >= 1024 * 1024) return `${(size / 1024 / 1024).toFixed(1)} MB`;
   if (size >= 1024) return `${Math.round(size / 1024)} KB`;
   return `${size} B`;
+}
+
+function formatElapsed(ms: number) {
+  if (ms >= 1000) return `${(ms / 1000).toFixed(2)} s`;
+  return `${ms} ms`;
 }
 
 function formatStatus(status: string) {
@@ -35,108 +46,215 @@ function formatStatus(status: string) {
   return status;
 }
 
-function isImageFile(name: string) {
-  return /\.(png|jpg|jpeg|gif|bmp|webp|svg)$/i.test(name);
+function formatDeliveryState(state: string) {
+  const normalized = state.toLowerCase();
+  if (normalized === "pending") return "待发送";
+  if (normalized === "sending") return "发送中";
+  if (normalized === "delivered") return "已送达";
+  if (normalized === "received") return "已接收";
+  if (normalized === "failed") return "失败";
+  return state;
+}
+
+function formatTime(unixMs: number) {
+  const date = new Date(unixMs);
+  const now = new Date();
+  const sameYear = date.getFullYear() === now.getFullYear();
+  const sameDay = sameYear && date.toDateString() === now.toDateString();
+  if (sameDay) {
+    return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit" }).format(date);
+  }
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function fileTypeLabel(name: string) {
+  const parts = name.split(".");
+  if (parts.length < 2) return "文件";
+  return parts[parts.length - 1].toUpperCase();
+}
+
+function fileIcon(name: string) {
+  if (/\.(png|jpg|jpeg|gif|bmp|webp|svg)$/i.test(name)) return <FileImage className="text-indigo-400" size={16} />;
+  if (/\.(zip|rar|7z|tar|gz)$/i.test(name)) return <FileArchive className="text-amber-400" size={16} />;
+  if (/\.(xls|xlsx|csv)$/i.test(name)) return <FileSpreadsheet className="text-emerald-400" size={16} />;
+  if (/\.(txt|md|doc|docx|pdf)$/i.test(name)) return <FileText className="text-blue-400" size={16} />;
+  return <File className="text-slate-400" size={16} />;
+}
+
+function flattenRows(records: TransferRecord[]) {
+  return records
+    .slice()
+    .sort((a, b) => b.created_at_unix_ms - a.created_at_unix_ms)
+    .flatMap<TransferRow>((record) =>
+      record.plan.manifest.files.map((file) => ({
+        transfer_id: record.plan.manifest.transfer_id,
+        created_at_unix_ms: record.created_at_unix_ms,
+        confirmed_at_unix_ms: record.confirmed_at_unix_ms,
+        elapsed_ms: record.elapsed_ms,
+        status: record.progress.status,
+        delivery_state: record.delivery_state,
+        delivery_message: record.delivery_message,
+        direction: record.direction,
+        peer_display_name: record.peer_display_name,
+        verified_files: record.verified_files,
+        total_bytes: record.progress.total_bytes,
+        file_name: file.name,
+        file_size_bytes: file.size_bytes,
+      })),
+    );
+}
+
+function transferSummary(records: TransferRecord[]) {
+  return records.reduce(
+    (summary, record) => {
+      summary.transfers += 1;
+      summary.files += record.plan.manifest.files.length;
+      summary.bytes += record.progress.total_bytes;
+      return summary;
+    },
+    { transfers: 0, files: 0, bytes: 0 },
+  );
+}
+
+function formatError(error: unknown) {
+  if (typeof error === "string") return error;
+  if (error instanceof Error) return error.message;
+  return String(error);
 }
 
 export function FileTransfer() {
   const [records, setRecords] = useState<TransferRecord[]>([]);
-  const [connectedCount, setConnectedCount] = useState(0);
-  const [pairedDeviceName, setPairedDeviceName] = useState("");
+  const [deviceSnapshot, setDeviceSnapshot] = useState<DeviceManagementSnapshot | null>(null);
+  const [connectionState, setConnectionState] = useState<ConnectionStateDto | null>(null);
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
-  const [statusText, setStatusText] = useState("将文件拖拽到窗口中，或点击下方按钮选择文件。");
+  const [statusText, setStatusText] = useState("请先确保双端已连接，然后选择要发送的文件。");
   const [error, setError] = useState("");
   const [isDragging, setIsDragging] = useState(false);
+  const [copiedPath, setCopiedPath] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   async function refresh() {
-    const [nextRecords, devices] = await Promise.all([listTransferPlans(), getDeviceManagementSnapshot()]);
+    const [nextRecords, nextDevices, nextConnectionState] = await Promise.all([
+      listTransferPlans(),
+      getDeviceManagementSnapshot(),
+      getConnectionState(),
+    ]);
     setRecords(nextRecords);
-    setConnectedCount(devices.devices.length);
-    const target = devices.devices.find((device) => device.status.toLowerCase() !== "revoked");
-    setPairedDeviceName(target?.display_name ?? "");
+    setDeviceSnapshot(nextDevices);
+    setConnectionState(nextConnectionState);
   }
 
   useEffect(() => {
-    void refresh();
+    void refresh().catch((nextError) => setError(formatError(nextError)));
   }, []);
+
+  const rows = useMemo(() => flattenRows(records), [records]);
+  const summary = useMemo(() => transferSummary(records), [records]);
+  const totalPendingBytes = useMemo(
+    () => pendingFiles.reduce((sum, file) => sum + file.size_bytes, 0),
+    [pendingFiles],
+  );
+
+  const activePeer = useMemo(() => {
+    if (!connectionState?.active_peer_device_id) return null;
+    return deviceSnapshot?.devices.find((device) => device.device_id === connectionState.active_peer_device_id) ?? null;
+  }, [connectionState?.active_peer_device_id, deviceSnapshot?.devices]);
+
+  const canSend = connectionState?.active_peer_state === "connected" && Boolean(activePeer);
 
   function updatePendingFromFileList(list: FileList | null) {
     if (!list || list.length === 0) return;
     const next = Array.from(list).map((file) => ({
       name: file.name,
       size_bytes: file.size,
+      file,
     }));
     setPendingFiles(next);
-    setStatusText(`已选择 ${next.length} 个文件，准备发送到已配对设备。`);
+    setStatusText(`已选择 ${next.length} 个文件，总大小 ${formatBytes(next.reduce((sum, file) => sum + file.size_bytes, 0))}`);
     setError("");
   }
 
   async function handleSendFiles() {
-    if (pendingFiles.length === 0) {
-      setError("请先选择要传输的文件。");
+    if (!pendingFiles.length) {
+      setError("请先选择要发送的文件。");
       return;
     }
-
-    const devices = await getDeviceManagementSnapshot();
-    const target = devices.devices.find((device) => device.status.toLowerCase() !== "revoked");
-    if (!target) {
-      setError("当前没有可用的已配对设备，无法开始传输。");
+    if (!canSend || !activePeer) {
+      setError("当前没有有效的双端连接，无法发送文件。");
       return;
     }
 
     try {
       setError("");
-      await createTransferPlan(target.device_id, pendingFiles);
-      setStatusText(`已向 ${target.display_name} 发起 ${pendingFiles.length} 个文件的传输。`);
+      const payload = await Promise.all(
+        pendingFiles.map(async (file) => ({
+          name: file.name,
+          size_bytes: file.size_bytes,
+          bytes: Array.from(new Uint8Array(await file.file.arrayBuffer())),
+        })),
+      );
+      const result = await createTransferPlan(activePeer.device_id, payload);
       setPendingFiles([]);
       if (fileInputRef.current) fileInputRef.current.value = "";
+      setStatusText(result.delivery_message ?? `已向 ${activePeer.display_name} 发送 ${payload.length} 个文件。`);
       await refresh();
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : String(nextError));
+      setError(formatError(nextError));
     }
   }
 
-  const totalPendingBytes = pendingFiles.reduce((sum, file) => sum + file.size_bytes, 0);
+  async function handleCopyPath(row: TransferRow) {
+    try {
+      const path = await getTransferArtifactPath(row.transfer_id, row.file_name);
+      await navigator.clipboard.writeText(path);
+      setCopiedPath(`${row.transfer_id}:${row.file_name}`);
+      window.setTimeout(() => setCopiedPath(null), 1500);
+    } catch (nextError) {
+      setError(formatError(nextError));
+    }
+  }
+
+  async function handleOpenLocation(row: TransferRow) {
+    try {
+      await revealTransferArtifactLocation(row.transfer_id, row.file_name);
+    } catch (nextError) {
+      setError(`打开位置失败：${formatError(nextError)}`);
+    }
+  }
 
   return (
     <div className="flex h-full w-full animate-in flex-col fade-in slide-in-from-bottom-4 duration-500">
       <div className="mb-3 flex items-center justify-between">
         <div>
-          <h2 className="mb-0.5 text-lg font-bold">文件传输</h2>
-          <p className="text-xs text-slate-400">在局域网配对设备之间发送文件，并查看最近的传输结果。</p>
+          <h2 className="mb-0.5 text-lg font-bold">文件发送</h2>
+          <p className="text-xs text-slate-400">补齐送达确认、失败状态和接收端回传后，记录才真正可信。</p>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            className="flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-[11px] font-medium text-slate-200 transition-colors hover:bg-slate-700"
-            onClick={() => void refresh()}
-            type="button"
-          >
-            <RefreshCw size={12} />
-            刷新
-          </button>
-          <div className="flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5">
-            <div className="h-1.5 w-1.5 rounded-full bg-green-500" />
-            <span className="text-[11px] font-medium text-slate-200">{connectedCount} 台设备已配对</span>
-          </div>
-        </div>
+        <button
+          className="flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-[11px] font-medium text-slate-200 transition-colors hover:bg-slate-700"
+          onClick={() => void refresh()}
+          type="button"
+        >
+          <RefreshCw size={12} />
+          刷新
+        </button>
       </div>
 
       <div className="flex flex-1 gap-4 overflow-hidden">
         <div className="flex w-[320px] shrink-0 flex-col overflow-hidden rounded-lg border border-slate-700 bg-slate-800/80 shadow-md">
           <div className="border-b border-slate-700 bg-slate-900/80 p-4">
-            <h3 className="mb-1 text-sm font-semibold text-white">发送文件</h3>
-            <p className="text-[11px] text-slate-400">
-              目标设备：{pairedDeviceName || "暂无可用配对设备"}
-            </p>
+            <h3 className="mb-1 text-sm font-semibold text-white">发送面板</h3>
+            <p className="text-[11px] text-slate-400">当前连接：{canSend && activePeer ? activePeer.display_name : "未建立有效连接"}</p>
           </div>
 
           <div className="flex flex-1 flex-col p-4">
             <div
               className={`flex flex-1 flex-col items-center justify-center rounded-xl border border-dashed p-4 text-center transition-all ${
-                isDragging
-                  ? "border-blue-400 bg-blue-500/10 text-blue-300"
-                  : "border-slate-700 bg-slate-900/40 text-slate-400"
+                isDragging ? "border-blue-400 bg-blue-500/10 text-blue-300" : "border-slate-700 bg-slate-900/40 text-slate-400"
               }`}
               onDragEnter={(event) => {
                 event.preventDefault();
@@ -158,16 +276,10 @@ export function FileTransfer() {
             >
               <Upload className="mb-3 text-blue-400" size={24} />
               <div className="text-sm font-medium text-slate-200">拖拽文件到这里</div>
-              <div className="mt-1 text-[11px] text-slate-500">支持一次选择多个文件，当前会保存传输验证结果到应用数据目录。</div>
+              <div className="mt-1 text-[11px] text-slate-500">发送端拿到接收端确认后，才会显示“已送达”。</div>
             </div>
 
-            <input
-              className="hidden"
-              multiple
-              onChange={(event) => updatePendingFromFileList(event.target.files)}
-              ref={fileInputRef}
-              type="file"
-            />
+            <input className="hidden" multiple onChange={(event) => updatePendingFromFileList(event.target.files)} ref={fileInputRef} type="file" />
 
             <div className="mt-3 flex gap-2">
               <button
@@ -180,7 +292,7 @@ export function FileTransfer() {
               </button>
               <button
                 className="flex flex-1 items-center justify-center gap-1.5 rounded-md bg-blue-600 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-blue-500 disabled:bg-slate-700 disabled:text-slate-400"
-                disabled={pendingFiles.length === 0}
+                disabled={!pendingFiles.length || !canSend}
                 onClick={() => void handleSendFiles()}
                 type="button"
               >
@@ -192,22 +304,20 @@ export function FileTransfer() {
             <div className="mt-4 rounded-lg border border-slate-700/60 bg-slate-900/60 p-3">
               <div className="mb-2 flex items-center justify-between">
                 <span className="text-[11px] font-medium text-slate-200">待发送文件</span>
-                <span className="text-[10px] text-slate-500">{pendingFiles.length} 个</span>
+                <span className="text-[10px] text-slate-500">{pendingFiles.length} 项</span>
               </div>
               {pendingFiles.length === 0 ? (
                 <div className="text-[11px] text-slate-500">还没有选择文件。</div>
               ) : (
-                <div className="space-y-2">
-                  {pendingFiles.slice(0, 5).map((file) => (
+                <div className="space-y-1.5">
+                  {pendingFiles.slice(0, 6).map((file) => (
                     <div className="flex items-center gap-2 rounded-md bg-slate-800/70 px-2 py-1.5" key={`${file.name}-${file.size_bytes}`}>
-                      {isImageFile(file.name) ? (
-                        <ImageIcon className="text-indigo-400" size={14} />
-                      ) : (
-                        <FileText className="text-blue-400" size={14} />
-                      )}
+                      {fileIcon(file.name)}
                       <div className="min-w-0 flex-1">
                         <div className="truncate text-[11px] text-slate-200">{file.name}</div>
-                        <div className="text-[10px] text-slate-500">{formatBytes(file.size_bytes)}</div>
+                        <div className="text-[10px] text-slate-500">
+                          {fileTypeLabel(file.name)} · {formatBytes(file.size_bytes)}
+                        </div>
                       </div>
                     </div>
                   ))}
@@ -216,90 +326,79 @@ export function FileTransfer() {
               )}
             </div>
 
-            <div className="mt-3 rounded-md border border-emerald-500/20 bg-emerald-400/10 p-2 text-[10px] text-emerald-400">
+            <div className={`mt-3 rounded-md border p-2 text-[10px] ${canSend ? "border-emerald-500/20 bg-emerald-400/10 text-emerald-400" : "border-amber-500/20 bg-amber-400/10 text-amber-300"}`}>
               {statusText}
             </div>
             {error ? <div className="mt-2 text-[10px] text-red-400">{error}</div> : null}
           </div>
         </div>
 
-        <div className="flex flex-1 flex-col overflow-hidden rounded-lg border border-slate-700 bg-slate-800/80 shadow-md">
+        <div className="flex min-w-0 flex-1 flex-col overflow-hidden rounded-lg border border-slate-700 bg-slate-800/80 shadow-md">
           <div className="flex items-center justify-between border-b border-slate-700 bg-slate-900/70 px-4 py-3">
             <div>
-              <h3 className="text-sm font-semibold text-white">最近传输记录</h3>
-              <p className="text-[11px] text-slate-400">显示当前会话中已经完成的传输验证记录。</p>
+              <h3 className="text-sm font-semibold text-white">发送记录</h3>
+              <p className="text-[11px] text-slate-400">单条记录同时展示方向、送达状态、确认时间和结果说明。</p>
             </div>
-            <div className="flex items-center gap-1.5 text-[11px] text-slate-400">
-              <FolderOpen size={12} />
-              结果文件保存到应用数据目录 `transfers`
+            <div className="flex items-center gap-2 text-[11px] text-slate-400">
+              <span>{summary.transfers} 次</span>
+              <span>·</span>
+              <span>{summary.files} 文件</span>
+              <span>·</span>
+              <span>{formatBytes(summary.bytes)}</span>
             </div>
           </div>
 
-          <div className="flex-1 space-y-3 overflow-y-auto bg-slate-800/40 p-4">
-            {records.length === 0 ? (
+          <div className="flex-1 overflow-y-auto bg-slate-800/40 p-3">
+            {rows.length === 0 ? (
               <div className="rounded-xl border border-dashed border-slate-700 bg-slate-900/40 p-4 text-sm text-slate-400">
-                还没有传输记录。选择文件并点击“发送”后，会在这里显示结果。
+                还没有发送记录。建立双端连接后，选择文件并点击“发送”，这里会显示确认后的真实结果。
               </div>
-            ) : null}
-
-            {records
-              .slice()
-              .reverse()
-              .map((record) => (
-                <div className="rounded-xl border border-slate-700 bg-slate-900/60 p-4 shadow-sm" key={record.plan.manifest.transfer_id}>
-                  <div className="mb-3 flex items-start justify-between gap-4">
-                    <div>
-                      <div className="flex items-center gap-2 text-sm font-medium text-slate-100">
-                        <Monitor className="text-blue-400" size={14} />
-                        <span>{record.plan.manifest.files.length} 个文件</span>
-                        <span className="text-slate-500">→</span>
-                        <MonitorSmartphone className="text-indigo-400" size={14} />
-                      </div>
-                      <div className="mt-1 text-[11px] text-slate-500">
-                        传输 ID：{record.plan.manifest.transfer_id}
-                      </div>
-                    </div>
-                    <div className="rounded-full border border-emerald-500/20 bg-emerald-400/10 px-2.5 py-1 text-[10px] font-medium text-emerald-400">
-                      {formatStatus(record.progress.status)}
-                    </div>
-                  </div>
-
-                  <div className="mb-3 grid grid-cols-3 gap-2 text-[11px] text-slate-400">
-                    <div className="rounded-md bg-slate-800/70 px-3 py-2">
-                      总大小
-                      <div className="mt-1 font-mono text-slate-200">{formatBytes(record.progress.total_bytes)}</div>
-                    </div>
-                    <div className="rounded-md bg-slate-800/70 px-3 py-2">
-                      已验证文件
-                      <div className="mt-1 font-mono text-slate-200">{record.verified_files}</div>
-                    </div>
-                    <div className="rounded-md bg-slate-800/70 px-3 py-2">
-                      耗时
-                      <div className="mt-1 font-mono text-slate-200">{record.elapsed_ms} ms</div>
-                    </div>
-                  </div>
-
-                  <div className="space-y-2">
-                    {record.plan.manifest.files.map((file) => (
-                      <div className="flex items-center gap-3 rounded-lg border border-slate-700/60 bg-slate-800/50 px-3 py-2" key={file.file_id}>
-                        {isImageFile(file.name) ? (
-                          <ImageIcon className="text-indigo-400" size={16} />
-                        ) : (
-                          <FileText className="text-blue-400" size={16} />
-                        )}
-                        <div className="min-w-0 flex-1">
-                          <div className="truncate text-sm text-slate-200">{file.name}</div>
-                          <div className="text-[10px] text-slate-500">{formatBytes(file.size_bytes)}</div>
-                        </div>
-                        <div className="flex items-center gap-1 text-[10px] text-slate-400">
-                          <Download size={12} />
-                          已生成验证文件
+            ) : (
+              <div className="space-y-2">
+                {rows.map((row) => {
+                  const copiedKey = `${row.transfer_id}:${row.file_name}`;
+                  return (
+                    <div className="flex items-center gap-3 rounded-lg border border-slate-700/70 bg-slate-900/60 px-3 py-2" key={copiedKey}>
+                      <div className="shrink-0 rounded-md bg-slate-800/80 p-2">{fileIcon(row.file_name)}</div>
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-[12px] font-medium text-slate-100">{row.file_name}</div>
+                        <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-[10px] text-slate-500">
+                          <span>{row.direction === "inbound" ? "接收" : "发送"}</span>
+                          {row.peer_display_name ? <span>{row.peer_display_name}</span> : null}
+                          <span>{fileTypeLabel(row.file_name)}</span>
+                          <span>{formatBytes(row.file_size_bytes)}</span>
+                          <span>{formatTime(row.created_at_unix_ms)}</span>
+                          {row.confirmed_at_unix_ms ? <span>确认 {formatTime(row.confirmed_at_unix_ms)}</span> : null}
+                          <span>{formatElapsed(row.elapsed_ms)}</span>
+                          <span>{formatStatus(row.status)}</span>
+                          <span>{formatDeliveryState(row.delivery_state)}</span>
+                          <span>校验 {row.verified_files}</span>
+                          {row.delivery_message ? <span>{row.delivery_message}</span> : null}
                         </div>
                       </div>
-                    ))}
-                  </div>
-                </div>
-              ))}
+                      <div className="flex shrink-0 items-center gap-1">
+                        <button
+                          className="flex items-center gap-1 rounded-md border border-slate-700 bg-slate-800 px-2 py-1 text-[10px] text-slate-300 transition-colors hover:bg-slate-700"
+                          onClick={() => void handleOpenLocation(row)}
+                          type="button"
+                        >
+                          <FolderOpen size={12} />
+                          位置
+                        </button>
+                        <button
+                          className="flex items-center gap-1 rounded-md border border-slate-700 bg-slate-800 px-2 py-1 text-[10px] text-slate-300 transition-colors hover:bg-slate-700"
+                          onClick={() => void handleCopyPath(row)}
+                          type="button"
+                        >
+                          {copiedPath === copiedKey ? <Check size={12} /> : <Copy size={12} />}
+                          复制
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         </div>
       </div>

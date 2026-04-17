@@ -13,7 +13,7 @@ use core_protocol::{DeviceDescriptor, PairingCode};
 use core_service::run_core_service;
 use core_session::{
     apply_device_repair, managed_devices_from_trust_store, schedule_device_reconnect,
-    manual_endpoint, process_pairing_request, session_descriptor, DeviceRepairAction,
+    build_client_tls_config, manual_endpoint, process_pairing_request, session_descriptor, DeviceRepairAction,
     ManagedDevice, PairingDecision, PairingRequest, DISCOVERY_PORT, SESSION_PORT,
     DEFAULT_OFFLINE_AFTER_MS,
 };
@@ -29,6 +29,7 @@ use foundation::{
 };
 use local_ipc::{send_command, CoreToUiEvent, UiToCoreCommand};
 use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
 use std::collections::HashMap;
 use std::fs;
 use std::sync::{Arc, Mutex};
@@ -248,16 +249,65 @@ struct TransferPlanRequest {
 struct TransferFileRequest {
     name: String,
     size_bytes: u64,
+    bytes: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct TransferRecord {
     plan: TransferPlan,
     progress: TransferProgress,
     verified_files: usize,
     elapsed_ms: u128,
+    created_at_unix_ms: u128,
+    #[serde(default = "default_transfer_direction")]
+    direction: String,
+    #[serde(default)]
+    peer_device_id: Option<String>,
+    #[serde(default)]
+    peer_display_name: Option<String>,
+    #[serde(default = "default_delivery_state")]
+    delivery_state: String,
+    #[serde(default)]
+    delivery_message: Option<String>,
+    #[serde(default)]
+    confirmed_at_unix_ms: Option<u128>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct TransferArtifactRequest {
+    transfer_id: String,
+    file_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct TransferArtifactPayload {
+    record: TransferRecord,
+    source_device_id: String,
+    source_display_name: String,
+    files: Vec<TransferArtifactFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct TransferArtifactFile {
+    name: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct TransferDeliveryAck {
+    ok: bool,
+    receiver_device_id: String,
+    receiver_display_name: String,
+    confirmed_at_unix_ms: u128,
+    verified_files: usize,
+    total_bytes: u64,
+    message: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -371,6 +421,8 @@ fn main() {
             update_input_tuning,
             create_transfer_plan,
             list_transfer_plans,
+            get_transfer_artifact_path,
+            reveal_transfer_artifact_location,
             get_device_management_snapshot,
             repair_managed_device,
             get_log_preview,
@@ -1535,6 +1587,17 @@ fn create_transfer_plan(
 ) -> Result<TransferRecord, String> {
     let target_device_id =
         Uuid::parse_str(&request.target_device_id).map_err(|error: uuid::Error| error.to_string())?;
+    let trust_store = load_trust_store(&state.data_paths).map_err(|error| error.to_string())?;
+    let trusted_target = trust_store
+        .trusted_device(target_device_id)
+        .cloned()
+        .ok_or_else(|| "target device is not trusted".to_string())?;
+    let discovery_peers = load_discovery_peers(&state.data_paths).map_err(|error| error.to_string())?;
+    let remote = discovery_peers
+        .iter()
+        .find(|peer| peer.device_id == trusted_target.device_id.to_string())
+        .map(discovery_peer_to_descriptor)
+        .ok_or_else(|| "target device is not currently discoverable".to_string())?;
     let source_device_id = {
         let clipboard = state
             .clipboard
@@ -1542,8 +1605,9 @@ fn create_transfer_plan(
             .map_err(|_| "failed to access clipboard state".to_string())?;
         clipboard.local_device_id()
     };
-    let files = request
-        .files
+    let request_files = request.files;
+    let file_bytes = request_files.iter().map(|file| file.bytes.clone()).collect::<Vec<_>>();
+    let files = request_files
         .into_iter()
         .map(|file| TransferFileDescriptor {
             file_id: Uuid::new_v4(),
@@ -1555,7 +1619,7 @@ fn create_transfer_plan(
         plan_transfer(source_device_id, target_device_id, files, None)
             .map_err(|error| error.to_string())?,
     );
-    let record = execute_memory_transfer(plan).map_err(|error| error.to_string())?;
+    let record = execute_remote_transfer(&state.data_paths, &remote, plan, file_bytes).map_err(|error| error.to_string())?;
     persist_transfer_artifacts(&state.data_paths, &record).map_err(|error| error.to_string())?;
     state
         .transfer_records
@@ -1592,11 +1656,35 @@ fn persist_transfer_artifacts(paths: &AppPaths, record: &TransferRecord) -> Resu
 
 #[tauri::command]
 fn list_transfer_plans(state: tauri::State<'_, AppState>) -> Result<Vec<TransferRecord>, String> {
-    state
-        .transfer_records
-        .lock()
-        .map(|records| records.clone())
-        .map_err(|_| "failed to access transfer records".to_string())
+    let records = load_transfer_records_from_disk(&state.data_paths).map_err(|error| error.to_string())?;
+    {
+        let mut slot = state
+            .transfer_records
+            .lock()
+            .map_err(|_| "failed to access transfer records".to_string())?;
+        *slot = records.clone();
+    }
+    Ok(records)
+}
+
+#[tauri::command]
+fn get_transfer_artifact_path(
+    state: tauri::State<'_, AppState>,
+    request: TransferArtifactRequest,
+) -> Result<String, String> {
+    resolve_transfer_artifact_path(&state.data_paths, &request.transfer_id, &request.file_name)
+        .map(|path| path.display().to_string())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn reveal_transfer_artifact_location(
+    state: tauri::State<'_, AppState>,
+    request: TransferArtifactRequest,
+) -> Result<(), String> {
+    let path = resolve_transfer_artifact_path(&state.data_paths, &request.transfer_id, &request.file_name)
+        .map_err(|error| error.to_string())?;
+    reveal_path_in_system(&path).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1791,8 +1879,149 @@ fn execute_memory_transfer(plan: TransferPlan) -> Result<TransferRecord> {
         progress: completed.1,
         verified_files: completed.0.files.len(),
         elapsed_ms: elapsed.as_millis(),
+        created_at_unix_ms: unix_time_now_ms(),
+        direction: default_transfer_direction(),
+        peer_device_id: None,
+        peer_display_name: None,
+        delivery_state: default_delivery_state(),
+        delivery_message: None,
+        confirmed_at_unix_ms: None,
         error: None,
     })
+}
+
+fn execute_remote_transfer(
+    paths: &AppPaths,
+    remote: &DeviceDescriptor,
+    plan: TransferPlan,
+    file_bytes: Vec<Vec<u8>>,
+) -> Result<TransferRecord> {
+    let local_identity = load_or_create_identity(paths, &default_display_name())?;
+    let mut record = execute_memory_transfer(plan.clone())?;
+    record.direction = "outbound".into();
+    record.peer_device_id = Some(remote.device_id.clone());
+    record.peer_display_name = Some(remote.display_name.clone());
+    record.delivery_state = "sending".into();
+    let payload = TransferArtifactPayload {
+        record: record.clone(),
+        source_device_id: local_identity.device_id.to_string(),
+        source_display_name: local_identity.display_name,
+        files: plan
+            .manifest
+            .files
+            .iter()
+            .zip(file_bytes)
+            .map(|(file, bytes)| TransferArtifactFile {
+                name: file.name.clone(),
+                bytes,
+            })
+            .collect(),
+    };
+
+    let client_config = std::sync::Arc::new(build_client_tls_config(paths, remote)?);
+    let stream = std::net::TcpStream::connect((remote.address.as_str(), remote.port))
+        .with_context(|| format!("connect remote transfer session {}:{}", remote.address, remote.port))?;
+    let server_name = rustls::pki_types::ServerName::try_from(remote.display_name.clone())
+        .map_err(|_| anyhow::anyhow!("invalid remote server name"))?;
+    let connection = rustls::ClientConnection::new(client_config, server_name)
+        .context("create transfer client tls connection")?;
+    let mut tls = rustls::StreamOwned::new(connection, stream);
+    let raw = serde_json::to_vec(&payload).context("serialize transfer payload")?;
+    tls.write_all(&(raw.len() as u64).to_be_bytes())
+        .context("write transfer payload length")?;
+    tls.write_all(&raw).context("write transfer payload body")?;
+    tls.flush().context("flush transfer payload")?;
+    let mut length_bytes = [0u8; 8];
+    tls.read_exact(&mut length_bytes).context("read transfer ack length")?;
+    let ack_len = u64::from_be_bytes(length_bytes);
+    let mut ack_bytes = vec![0u8; ack_len as usize];
+    tls.read_exact(&mut ack_bytes).context("read transfer ack payload")?;
+    let ack: TransferDeliveryAck = serde_json::from_slice(&ack_bytes).context("parse transfer ack payload")?;
+    if !ack.ok {
+        record.delivery_state = "failed".into();
+        record.delivery_message = Some(ack.message);
+        record.error = record.delivery_message.clone();
+        return Ok(record);
+    }
+    record.delivery_state = "delivered".into();
+    record.delivery_message = Some(ack.message);
+    record.peer_device_id = Some(ack.receiver_device_id);
+    record.peer_display_name = Some(ack.receiver_display_name);
+    record.confirmed_at_unix_ms = Some(ack.confirmed_at_unix_ms);
+    record.verified_files = ack.verified_files;
+    record.progress.transferred_bytes = ack.total_bytes;
+    record.progress.total_bytes = ack.total_bytes;
+    record.progress.status = core_file_transfer::TransferStatus::Completed;
+
+    Ok(record)
+}
+
+fn load_transfer_records_from_disk(paths: &AppPaths) -> Result<Vec<TransferRecord>> {
+    paths.ensure_layout()?;
+    let mut records = Vec::new();
+
+    for entry in fs::read_dir(paths.transfers_dir()).context("read transfer artifacts directory")? {
+        let entry = entry.context("read transfer artifact entry")?;
+        let summary_path = entry.path().join("transfer-record.json");
+        if !summary_path.exists() {
+            continue;
+        }
+
+        let raw = fs::read_to_string(&summary_path)
+            .with_context(|| format!("read transfer record summary from {}", summary_path.display()))?;
+        let record: TransferRecord = serde_json::from_str(&raw)
+            .with_context(|| format!("parse transfer record summary from {}", summary_path.display()))?;
+        records.push(record);
+    }
+
+    records.sort_by_key(|record| record.created_at_unix_ms);
+    Ok(records)
+}
+
+fn resolve_transfer_artifact_path(paths: &AppPaths, transfer_id: &str, file_name: &str) -> Result<std::path::PathBuf> {
+    let transfer_id = transfer_id.trim();
+    let file_name = file_name.trim();
+    if transfer_id.is_empty() || file_name.is_empty() {
+        anyhow::bail!("transfer artifact identity is incomplete");
+    }
+
+    let candidate = paths.transfers_dir().join(transfer_id).join(file_name);
+    if !candidate.exists() {
+        anyhow::bail!("transfer artifact not found: {}", candidate.display());
+    }
+
+    Ok(candidate)
+}
+
+fn reveal_path_in_system(path: &std::path::Path) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer.exe")
+            .arg(format!("/select,{}", path.display()))
+            .spawn()
+            .context("open explorer for transfer artifact")?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn()
+            .context("reveal transfer artifact in Finder")?;
+        return Ok(());
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        let target = path.parent().unwrap_or(path);
+        std::process::Command::new("xdg-open")
+            .arg(target)
+            .spawn()
+            .context("open transfer artifact directory")?;
+        return Ok(());
+    }
 }
 
 fn deterministic_transfer_bytes(file_id: Uuid, size_bytes: u64) -> Result<Vec<u8>> {
@@ -1837,6 +2066,14 @@ fn metric(name: impl Into<String>, value: impl Into<String>, status: impl Into<S
         value: value.into(),
         status: status.into(),
     }
+}
+
+fn default_transfer_direction() -> String {
+    "outbound".into()
+}
+
+fn default_delivery_state() -> String {
+    "pending".into()
 }
 
 fn discovery_peer_to_descriptor(peer: &DiscoveryPeer) -> DeviceDescriptor {

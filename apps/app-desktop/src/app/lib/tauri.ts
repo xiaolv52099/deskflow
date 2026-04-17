@@ -62,6 +62,13 @@ export interface DeviceManagementSnapshot {
 }
 
 export interface TransferRecord {
+  created_at_unix_ms: number;
+  direction: string;
+  peer_device_id?: string | null;
+  peer_display_name?: string | null;
+  delivery_state: string;
+  delivery_message?: string | null;
+  confirmed_at_unix_ms?: number | null;
   plan: {
     manifest: {
       transfer_id: string;
@@ -240,7 +247,7 @@ export async function repairManagedDevice(device_id: string, action: "mark_onlin
   });
 }
 
-export async function createTransferPlan(target_device_id: string, files: { name: string; size_bytes: number }[]) {
+export async function createTransferPlan(target_device_id: string, files: { name: string; size_bytes: number; bytes: number[] }[]) {
   return invoke<TransferRecord>("create_transfer_plan", {
     request: { target_device_id, files },
   });
@@ -248,6 +255,18 @@ export async function createTransferPlan(target_device_id: string, files: { name
 
 export async function listTransferPlans() {
   return invoke<TransferRecord[]>("list_transfer_plans");
+}
+
+export async function getTransferArtifactPath(transfer_id: string, file_name: string) {
+  return invoke<string>("get_transfer_artifact_path", {
+    request: { transfer_id, file_name },
+  });
+}
+
+export async function revealTransferArtifactLocation(transfer_id: string, file_name: string) {
+  return invoke<void>("reveal_transfer_artifact_location", {
+    request: { transfer_id, file_name },
+  });
 }
 
 export async function getInputTuning() {

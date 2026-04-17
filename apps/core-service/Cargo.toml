@@ -7,11 +7,15 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+core-file-transfer = { path = "../../crates/core-file-transfer" }
 core-protocol = { path = "../../crates/core-protocol" }
 core-session = { path = "../../crates/core-session" }
 core-topology = { path = "../../crates/core-topology" }
 device-trust = { path = "../../crates/device-trust" }
 foundation = { path = "../../crates/foundation" }
+rustls = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
