@@ -13,7 +13,7 @@ export function Sidebar({ activeTab, setActiveTab }: SidebarProps) {
   ];
 
   return (
-    <div className="flex w-36 shrink-0 flex-col border-r border-slate-700 bg-slate-800 select-none">
+    <div className="flex w-36 shrink-0 select-none flex-col border-r border-slate-700 bg-slate-800">
       <nav className="flex-1 space-y-1 px-2.5 py-4">
         {tabs.map((tab) => {
           const Icon = tab.icon;
@@ -21,11 +21,11 @@ export function Sidebar({ activeTab, setActiveTab }: SidebarProps) {
           return (
             <button
               key={tab.id}
-              className={`w-full rounded-xl border px-2 py-4 text-xs transition-all ${
+              className={`flex w-full flex-col items-center justify-center gap-1.5 rounded-xl border px-2 py-4 text-xs transition-all ${
                 isActive
                   ? "border-blue-500/30 bg-blue-600/20 text-blue-400 shadow-sm"
                   : "border-transparent text-slate-400 hover:bg-slate-700/50 hover:text-slate-200"
-              } flex flex-col items-center justify-center gap-1.5`}
+              }`}
               onClick={() => setActiveTab(tab.id)}
               type="button"
             >
@@ -35,9 +35,7 @@ export function Sidebar({ activeTab, setActiveTab }: SidebarProps) {
           );
         })}
       </nav>
-      <div className="border-t border-slate-700/60 p-3 text-center font-mono text-[10px] text-slate-500">
-        v0.1.0
-      </div>
+      <div className="border-t border-slate-700/60 p-3 text-center font-mono text-[10px] text-slate-500">v0.1.0</div>
     </div>
   );
 }

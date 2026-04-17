@@ -16,13 +16,33 @@ pub const DEVICE_CERTIFICATE_FILE_NAME: &str = "device-certificate.json";
 pub const TRUST_STORE_FILE_NAME: &str = "trust-store.json";
 pub const TOPOLOGY_FILE_NAME: &str = "topology.json";
 pub const DISCOVERY_FILE_NAME: &str = "discovery.json";
+pub const TRANSFERS_DIR_NAME: &str = "transfers";
 pub const DATA_ROOT_ENV_VAR: &str = "DESKFLOW_PLUS_DATA_ROOT";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InputTuningConfig {
+    pub pointer_speed_multiplier: f64,
+    pub wheel_speed_multiplier: f64,
+    pub wheel_smoothing_factor: f64,
+}
+
+impl Default for InputTuningConfig {
+    fn default() -> Self {
+        Self {
+            pointer_speed_multiplier: 1.0,
+            wheel_speed_multiplier: 1.0,
+            wheel_smoothing_factor: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppConfig {
     pub log_level: String,
     pub auto_discovery_enabled: bool,
     pub clipboard_enabled: bool,
+    #[serde(default)]
+    pub input_tuning: InputTuningConfig,
 }
 
 impl Default for AppConfig {
@@ -31,6 +51,7 @@ impl Default for AppConfig {
             log_level: "info".to_string(),
             auto_discovery_enabled: true,
             clipboard_enabled: true,
+            input_tuning: InputTuningConfig::default(),
         }
     }
 }
@@ -63,7 +84,7 @@ pub struct DiagnosticMetric {
     pub status: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExtendedDiagnosticSnapshot {
     pub generated_at_unix_ms: u128,
     pub config: AppConfig,
@@ -129,6 +150,10 @@ impl AppPaths {
         self.root.join("discovery")
     }
 
+    pub fn transfers_dir(&self) -> PathBuf {
+        self.root.join(TRANSFERS_DIR_NAME)
+    }
+
     pub fn config_file(&self) -> PathBuf {
         self.config_dir().join(CONFIG_FILE_NAME)
     }
@@ -168,6 +193,7 @@ impl AppPaths {
         fs::create_dir_all(self.security_dir()).context("create security directory")?;
         fs::create_dir_all(self.topology_dir()).context("create topology directory")?;
         fs::create_dir_all(self.discovery_dir()).context("create discovery directory")?;
+        fs::create_dir_all(self.transfers_dir()).context("create transfers directory")?;
         Ok(())
     }
 }

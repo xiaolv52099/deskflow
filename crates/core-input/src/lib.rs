@@ -528,7 +528,7 @@ mod tests {
         let mut topology = TopologyLayout::new(controller, "controller");
         topology.add_pending_device(client, "client").expect("add pending");
         topology
-            .place_device(client, GridPosition { x: 3, y: 1 })
+            .place_device(client, GridPosition { x: 2, y: 1 })
             .expect("place client");
         (topology, controller, client)
     }

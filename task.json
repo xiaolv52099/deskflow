@@ -5,233 +5,35 @@
     "current_phase": "integration"
   },
   "meta": {
-    "last_updated": "2026-04-17T01:12:00+08:00",
-    "version": 5
+    "last_updated": "2026-04-17T04:35:00+08:00",
+    "version": 6
   },
   "assumptions": [
-    "仅支持 Windows 和 macOS",
-    "局域网直连",
-    "核心链路使用 TLS 与设备配对建立信任",
-    "主副屏相对位置通过固定网格拖拽配置",
-    "默认语言为中文",
-    "Windows 本机负责 Windows 构建验证，macOS 构建和权限验证需要在 Mac 上完成",
-    "当前实现包含核心模型、桌面端验证入口和打包验证；真实多机联调仍需要两台设备实测"
+    "当前目标平台仅包含 Windows 和 macOS",
+    "产品默认运行在局域网直连场景",
+    "主副屏相对位置通过 3x3 网格拖拽配置",
+    "默认界面语言为中文",
+    "Windows 端负责 Windows 构建验证，macOS 打包和权限验证需要在 Mac 上完成",
+    "当前已完成桌面端集成与本机验证，真实多机联调仍需要两台以上设备继续验证"
   ],
   "tasks": [
-    {
-      "id": "P0-001",
-      "title": "项目骨架与工作区",
-      "priority": "P0",
-      "module": "foundation",
-      "status": "done",
-      "depends_on": [],
-      "summary": "创建 Rust workspace、Tauri 桌面壳、核心服务和本地 IPC 基础结构。",
-      "acceptance": ["目录结构固定", "workspace 可解析", "桌面端和核心服务入口存在"],
-      "tests": [{"type": "completion", "name": "结构检查", "status": "passed"}],
-      "performance_checks": [],
-      "notes": ["已创建 apps、crates 和基础 workspace 结构。"]
-    },
-    {
-      "id": "P0-002",
-      "title": "需求、架构与 ADR 固化",
-      "priority": "P0",
-      "module": "foundation",
-      "status": "done",
-      "depends_on": [],
-      "summary": "固化需求文档、架构说明和关键技术决策。",
-      "acceptance": ["主文档存在", "架构文档存在", "任务计划同步"],
-      "tests": [{"type": "completion", "name": "文档一致性检查", "status": "passed"}],
-      "performance_checks": [{"name": "不适用", "status": "na"}],
-      "notes": ["已完成 Deskflow-Plus 的需求、技术背景、架构和任务拆分文档。"]
-    },
-    {
-      "id": "P0-003",
-      "title": "桌面壳与核心进程边界",
-      "priority": "P0",
-      "module": "foundation",
-      "status": "done",
-      "depends_on": ["P0-001", "P0-002"],
-      "summary": "建立桌面端与核心服务的启动、握手和关闭边界。",
-      "acceptance": ["桌面端可启动", "IPC 可用", "生命周期明确"],
-      "tests": [{"type": "integration", "name": "进程边界测试", "status": "passed"}],
-      "performance_checks": [{"name": "空闲开销检查", "status": "passed"}],
-      "notes": [
-        "local-ipc 已支持版本握手、Ping、Ready 和 Shutdown。",
-        "app-desktop 已改为内嵌 core-service runtime，解决安装后找不到外部 core-service.exe 导致无界面的问题。"
-      ]
-    },
-    {
-      "id": "P0-004",
-      "title": "配置、日志与诊断基础",
-      "priority": "P0",
-      "module": "foundation",
-      "status": "done",
-      "depends_on": ["P0-001"],
-      "summary": "建立配置持久化、日志路径和诊断快照基础能力。",
-      "acceptance": ["配置可读写", "日志可持久化", "诊断可导出"],
-      "tests": [{"type": "completion", "name": "配置日志测试", "status": "passed"}],
-      "performance_checks": [{"name": "日志开销检查", "status": "passed"}],
-      "notes": ["foundation crate 已提供 AppPaths、AppConfig、日志追加和基础诊断导出。"]
-    },
-    {
-      "id": "P0-005",
-      "title": "协议帧与消息模型",
-      "priority": "P0",
-      "module": "protocol",
-      "status": "done",
-      "depends_on": ["P0-003", "P0-004"],
-      "summary": "定义协议版本、通道、优先级队列和 JSON-line 协议帧。",
-      "acceptance": ["协议可协商", "消息已定义", "编解码可测"],
-      "tests": [{"type": "completion", "name": "协议编解码测试", "status": "passed"}],
-      "performance_checks": [{"name": "优先级队列测试", "status": "passed"}],
-      "notes": ["core-protocol 已覆盖控制、诊断、会话和文件传输消息，输入消息优先级高于文件传输。"]
-    },
-    {
-      "id": "P0-006",
-      "title": "设备身份与信任模型落地",
-      "priority": "P0",
-      "module": "security",
-      "status": "done",
-      "depends_on": ["P0-004", "P0-005"],
-      "summary": "实现设备身份、证书、信任库和撤销能力。",
-      "acceptance": ["身份可持久化", "证书可生成", "信任库可读写"],
-      "tests": [{"type": "completion", "name": "身份信任测试", "status": "passed"}],
-      "performance_checks": [{"name": "证书生成耗时", "status": "passed"}],
-      "notes": ["device-trust 已支持自签证书、证书指纹、信任校验和撤销。"]
-    },
-    {
-      "id": "P0-007",
-      "title": "发现、配对与安全会话",
-      "priority": "P0",
-      "module": "session",
-      "status": "done",
-      "depends_on": ["P0-005", "P0-006"],
-      "summary": "实现发现、手动端点、配对确认、TLS 配置、心跳和重连状态模型。",
-      "acceptance": ["可发现设备", "可手动添加", "会话可建立", "未信任设备被拒绝"],
-      "tests": [{"type": "completion", "name": "发现配对会话测试", "status": "passed"}],
-      "performance_checks": [{"name": "TLS 配置与 loopback 会话测试", "status": "passed"}],
-      "notes": [
-        "core-session 已支持配对信任、远端证书校验、Rustls 配置和 loopback TLS 握手测试。",
-        "app-desktop 已新增最小可用的手工配对串流程：生成本机配对串、导入对端配对串并写入本地信任库。",
-        "core-service 已接入 UDP 广播自动发现，发现快照包含证书信息，可直接转为信任配对；桌面端会过滤过期设备，避免离线设备长期残留。"
-      ]
-    },
-    {
-      "id": "P0-008",
-      "title": "拓扑模型与热更新",
-      "priority": "P0",
-      "module": "topology",
-      "status": "done",
-      "depends_on": ["P0-003", "P0-007"],
-      "summary": "实现固定网格拓扑、设备放置、离线占位、合法性校验和热更新。",
-      "acceptance": ["拓扑可持久化", "非法布局被拒绝", "热更新不中断连接"],
-      "tests": [{"type": "completion", "name": "拓扑模型测试", "status": "passed"}],
-      "performance_checks": [{"name": "热更新时间测试", "status": "passed"}],
-      "notes": ["core-topology 已支持 3x3 网格、相邻关系、待布局设备和拓扑版本更新，并可迁移旧 5x3 布局。"]
-    },
     {
       "id": "P0-009",
       "title": "拓扑编辑界面",
       "priority": "P0",
       "module": "ui",
       "status": "done",
-      "depends_on": ["P0-008"],
-      "summary": "实现拖拽放置设备、待布局区和错误反馈。",
-      "acceptance": ["设备可拖拽", "待布局区可见", "非法布局有反馈"],
-      "tests": [{"type": "completion", "name": "拓扑交互构建测试", "status": "passed"}],
-      "performance_checks": [{"name": "拖拽流畅性检查", "status": "passed"}],
-      "notes": [
-        "app-desktop 已提供固定网格拖拽拓扑配置 UI。",
-        "前端展示层已切换为 /front 提供的 TSX 界面结构，并在不改变视觉效果的前提下接入拖拽拓扑能力。"
-      ]
-    },
-    {
-      "id": "P0-010",
-      "title": "Windows 输入链路",
-      "priority": "P0",
-      "module": "input",
-      "status": "done",
-      "depends_on": ["P0-007", "P0-008"],
-      "summary": "实现 Windows 光标查询、边界切换模型和输入注入适配。",
-      "acceptance": ["可捕获输入", "可注入输入", "边界切换正确"],
-      "tests": [{"type": "completion", "name": "Windows 输入测试", "status": "passed"}],
-      "performance_checks": [{"name": "输入路由延迟测试", "status": "passed"}],
-      "notes": ["core-input 已支持 Win32 GetCursorPos、SetCursorPos 和 SendInput 适配。"]
-    },
-    {
-      "id": "P0-011",
-      "title": "macOS 输入链路",
-      "priority": "P0",
-      "module": "input",
-      "status": "done",
-      "depends_on": ["P0-007", "P0-008"],
-      "summary": "建立 macOS 输入适配状态和权限引导模型。",
-      "acceptance": ["可捕获输入", "可注入输入", "权限引导存在"],
-      "tests": [{"type": "completion", "name": "macOS 输入状态测试", "status": "passed"}],
-      "performance_checks": [{"name": "macOS 运行时待实机验证", "status": "pending_external"}],
-      "notes": ["Windows 环境只能完成编译和模型验证；macOS 运行时权限需要在 Mac 上验证。"]
-    },
-    {
-      "id": "P0-012",
-      "title": "文本剪贴板同步",
-      "priority": "P0",
-      "module": "clipboard",
-      "status": "done",
-      "depends_on": ["P0-007"],
-      "summary": "实现文本剪贴板更新、同步开关和循环抑制。",
-      "acceptance": ["文本双向同步", "循环被抑制", "可关闭同步"],
-      "tests": [{"type": "completion", "name": "文本剪贴板测试", "status": "passed"}],
-      "performance_checks": [{"name": "同步耗时测试", "status": "passed"}],
-      "notes": ["core-clipboard 已支持文本规范化、序列号去重和禁用状态抑制。"]
-    },
-    {
-      "id": "P0-013",
-      "title": "常驻壳与权限引导",
-      "priority": "P0",
-      "module": "desktop",
-      "status": "done",
-      "depends_on": ["P0-003", "P0-010", "P0-011"],
-      "summary": "实现托盘菜单、后台常驻、启动行为和权限状态展示。",
-      "acceptance": ["可后台常驻", "平台入口可见", "权限引导可用"],
-      "tests": [{"type": "completion", "name": "桌面壳测试", "status": "passed"}],
-      "performance_checks": [{"name": "空闲资源占用检查", "status": "passed"}],
-      "notes": [
-        "app-desktop 已接入 Tauri tray-icon，并提供中文主界面。",
-        "桌面端与嵌入式 core-service 现已共享持久化数据目录，发现结果、信任关系与拓扑布局可跨重启保留。"
-      ]
-    },
-    {
-      "id": "P0-014",
-      "title": "MVP 集成验证",
-      "priority": "P0",
-      "module": "integration",
-      "status": "done",
-      "depends_on": ["P0-009", "P0-012", "P0-013"],
-      "summary": "完成发现、配对、拓扑、键鼠、文本剪贴板和桌面壳的集成验证。",
-      "acceptance": ["可发现设备", "可完成配对", "可共享键鼠", "可同步文本剪贴板"],
-      "tests": [{"type": "integration", "name": "MVP 集成测试", "status": "passed"}],
-      "performance_checks": [{"name": "MVP 基线测试", "status": "passed"}],
-      "notes": ["Windows 本机测试通过；macOS 仍需在 Mac 上做最终运行和打包验证。"]
-    },
-    {
-      "id": "P1-001",
-      "title": "图片剪贴板共享",
-      "priority": "P1",
-      "module": "clipboard",
-      "status": "done",
-      "depends_on": ["P0-014"],
-      "summary": "在文本剪贴板基础上增加图片同步模型和桌面端模拟入口。",
-      "acceptance": ["图片双向同步", "跨平台格式转换可用"],
+      "summary": "在新 TSX 界面中保留连接配置与 3x3 屏幕拖拽布局能力。",
       "tests": [
-        {"type": "completion", "name": "图片剪贴板核心测试", "status": "passed"},
-        {"type": "ui", "name": "桌面端图片剪贴板模拟入口构建测试", "status": "passed"}
+        {
+          "type": "build",
+          "name": "npm run build",
+          "status": "passed"
+        }
       ],
-      "performance_checks": [{"name": "图片载荷校验与去重路径测试", "status": "passed"}],
       "notes": [
-        "core-clipboard 已支持文本和图片两类 ClipboardContent。",
-        "图片载荷支持 PNG 与 BGRA8 格式模型，BGRA8 会校验尺寸与字节长度。",
-        "图片剪贴板更新支持 SHA-256 去重、远端序列循环抑制和禁用状态抑制。",
-        "app-desktop 已增加模拟图片剪贴板广播入口；真实系统剪贴板桥接仍需平台适配。"
+        "连接配置页已接入真实设备信息、自动发现、信任配对、手动连接与拓扑拖拽。",
+        "页面中文文案已重写，移除了原有乱码和无效占位内容。"
       ]
     },
     {
@@ -240,19 +42,30 @@
       "priority": "P1",
       "module": "file-transfer",
       "status": "done",
-      "depends_on": ["P0-014", "P0-005"],
-      "summary": "实现应用内文件传输核心、协议消息和桌面端验证入口。",
-      "acceptance": ["支持单/多文件", "支持进度与取消", "接收端可确认"],
+      "summary": "在新界面中实现文件选择、拖拽、传输记录展示和本地验证产物落盘。",
       "tests": [
-        {"type": "completion", "name": "文件传输核心单元测试", "status": "passed"},
-        {"type": "integration", "name": "桌面端内存回环传输验证", "status": "passed"}
+        {
+          "type": "build",
+          "name": "npm run build",
+          "status": "passed"
+        },
+        {
+          "type": "unit",
+          "name": "cargo test -p core-file-transfer -- --nocapture",
+          "status": "passed"
+        }
       ],
-      "performance_checks": [{"name": "5MB 内存分块、校验、重组性能测试", "status": "passed"}],
+      "performance_checks": [
+        {
+          "name": "5MB 内存回环文件传输",
+          "status": "passed",
+          "detail": "132.0357ms"
+        }
+      ],
       "notes": [
-        "core-file-transfer 已支持真实分块、SHA-256 校验、接收端重组、乱序到达、重复块幂等和取消阻断。",
-        "core-protocol 已新增文件传输 Offer、Accept、Reject、Chunk、Progress 和 Cancel 消息。",
-        "app-desktop 的传输入口已从仅创建计划升级为内存回环传输验证。",
-        "真实跨设备网络文件流仍需在 session 传输层继续接入。"
+        "文件传输页已支持多文件选择和拖拽。",
+        "创建传输后会生成真实传输记录，并将验证文件写入应用数据目录 transfers/<transfer_id>/。",
+        "当前仍是本机验证链路，真实跨设备网络文件流还需要继续接入 session 传输层。"
       ]
     },
     {
@@ -261,42 +74,34 @@
       "priority": "P1",
       "module": "input",
       "status": "done",
-      "depends_on": ["P0-014"],
-      "summary": "增加鼠标灵敏度和滚轮平滑调节。",
-      "acceptance": ["灵敏度可调", "滚轮平滑可调", "默认行为稳定"],
+      "summary": "完成鼠标速度、滚轮速度和滚轮平滑度调节，并在设置页接入持久化。",
       "tests": [
-        {"type": "completion", "name": "输入调优核心测试", "status": "passed"},
-        {"type": "routing", "name": "按目标设备应用输入配置测试", "status": "passed"}
+        {
+          "type": "build",
+          "name": "cargo check -p app-desktop -j 1",
+          "status": "passed"
+        },
+        {
+          "type": "unit",
+          "name": "cargo test -p core-input -- --nocapture",
+          "status": "passed"
+        }
       ],
       "performance_checks": [
-        {"name": "输入路由延迟测试", "status": "passed"},
-        {"name": "滚轮平滑分段保持总位移测试", "status": "passed"}
+        {
+          "name": "windows input route elapsed",
+          "status": "passed",
+          "detail": "200ns"
+        },
+        {
+          "name": "windows cursor sample elapsed",
+          "status": "passed",
+          "detail": "35.1µs"
+        }
       ],
       "notes": [
-        "InputTuningProfile 已增加归一化约束，支持按设备保存并读取调优配置。",
-        "InputRouter 已提供 route_event_with_tuning，可在远端转发事件上应用目标设备配置。",
-        "滚轮平滑从单次放大改为多段 TimedInputEvent 输出，总滚动距离保持不丢失。"
-      ]
-    },
-    {
-      "id": "P1-004",
-      "title": "恢复能力与设备管理界面",
-      "priority": "P1",
-      "module": "session",
-      "status": "done",
-      "depends_on": ["P0-014"],
-      "summary": "完善断线恢复、异常提示、设备状态和偏好管理。",
-      "acceptance": ["中断后可恢复", "状态可修复", "设备管理界面可用"],
-      "tests": [
-        {"type": "completion", "name": "恢复扫描与设备修复模型测试", "status": "passed"},
-        {"type": "ui", "name": "设备管理界面构建测试", "status": "passed"}
-      ],
-      "performance_checks": [{"name": "重连退避模型测试", "status": "passed"}],
-      "notes": [
-        "core-session 已增加 ManagedDevice、RecoveryScan、DeviceRepairAction 和恢复扫描模型。",
-        "支持按 last_seen 判断在线、离线、重连中和已撤销状态，并可计算重连退避。",
-        "app-desktop 已增加设备管理面板，支持刷新、立即重试、标记在线和撤销信任。",
-        "当前为管理状态模型和本地信任库操作，真实跨机自动重连仍需 session 网络运行时接管。"
+        "输入调节参数已持久化到 config.json，应用重启后保留。",
+        "core-input 测试已同步到 3x3 网格拓扑。"
       ]
     },
     {
@@ -305,38 +110,51 @@
       "priority": "P1",
       "module": "ui",
       "status": "done",
-      "depends_on": ["P0-013"],
-      "summary": "将软件默认语言和主要界面文案切换为中文。",
-      "acceptance": ["主界面默认中文", "托盘菜单默认中文", "传输和输入调节文案默认中文"],
-      "tests": [{"type": "completion", "name": "前端中文构建测试", "status": "passed"}],
-      "performance_checks": [{"name": "不适用", "status": "na"}],
+      "summary": "完成新界面三大页面与侧边栏中文化。",
+      "tests": [
+        {
+          "type": "build",
+          "name": "npm run build",
+          "status": "passed"
+        }
+      ],
       "notes": [
-        "app-desktop React 主界面默认文案已切换为中文。",
-        "状态标签、按钮、空状态、自动发现、设备管理、手工配对、传输队列、诊断和输入调节区域已使用中文显示。",
-        "桌面前端现已迁移为 /front 的 TSX 页面，并仅保留 /front 上展示的连接配置、文件传输和系统设置三类界面功能。",
-        "已修复 task.json 中因 PowerShell 编码导致的问号污染。"
+        "侧边栏、连接配置、文件传输、系统设置页面的主文案均已切换为中文。",
+        "仍有少量 Rust 侧旧中文错误文案未完全统一，但不影响主界面展示。"
       ]
     },
     {
       "id": "P2-001",
-      "title": "诊断与性能专项优化",
+      "title": "诊断与可观测性",
       "priority": "P2",
       "module": "observability",
       "status": "done",
-      "depends_on": ["P1-003"],
-      "summary": "增强诊断导出、日志可观测性和关键路径性能记录。",
-      "acceptance": ["诊断数据可导出", "日志更可读", "关键路径优于基线"],
+      "summary": "在新界面中接入日志预览与诊断导出，并补充扩展配置结构。",
       "tests": [
-        {"type": "completion", "name": "扩展诊断快照测试", "status": "passed"},
-        {"type": "ui", "name": "诊断导出入口构建测试", "status": "passed"}
+        {
+          "type": "unit",
+          "name": "cargo test -p foundation -- --nocapture",
+          "status": "passed"
+        }
       ],
-      "performance_checks": [{"name": "关键路径回归测试", "status": "passed"}],
       "notes": [
-        "foundation 已新增 ExtendedDiagnosticSnapshot、DiagnosticMetric 和日志尾部读取。",
-        "app-desktop 已增加诊断导出命令，写入配置、日志尾部、拓扑路径、信任库路径和运行指标。",
-        "UI 已增加诊断导出入口，并展示导出路径和指标数量。",
-        "诊断文件当前输出到应用数据目录 diagnostic/diagnostic-extended.json。"
+        "设置页已支持日志预览和诊断快照导出。",
+        "配置结构已扩展输入调节字段，并保持向后兼容。"
       ]
     }
+  ],
+  "verification": {
+    "frontend_build": "passed",
+    "rust_check": "passed",
+    "targeted_tests": [
+      "foundation",
+      "core-file-transfer",
+      "core-input"
+    ]
+  },
+  "remaining_risks": [
+    "真实跨设备文件传输数据面尚未接入 session 层网络传输",
+    "macOS 运行时权限、输入注入和打包验证仍需在 Mac 上完成",
+    "多机真实局域网回归和安装升级卸载验证尚未完成"
   ]
 }

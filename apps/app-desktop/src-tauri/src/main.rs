@@ -23,12 +23,14 @@ use device_trust::{
     revoke_trusted_device, save_identity,
 };
 use foundation::{
-    append_log, export_extended_diagnostic_snapshot, load_discovery_peers, load_or_create_config, read_recent_log_lines, AppPaths,
-    DiagnosticMetric, DiscoveryPeer, DATA_ROOT_ENV_VAR,
+    append_log, export_extended_diagnostic_snapshot, load_discovery_peers, load_or_create_config,
+    read_recent_log_lines, save_config, AppConfig, AppPaths, DiagnosticMetric, DiscoveryPeer,
+    DATA_ROOT_ENV_VAR,
 };
 use local_ipc::{send_command, CoreToUiEvent, UiToCoreCommand};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
 use std::sync::{Arc, Mutex};
 use tauri::menu::{MenuBuilder, MenuEvent, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -53,6 +55,7 @@ struct AppState {
     owns_core_service: bool,
     core_join: Mutex<Option<std::thread::JoinHandle<()>>>,
     data_paths: AppPaths,
+    config: Mutex<AppConfig>,
     health: Mutex<AppHealth>,
     topology: Mutex<TopologyLayout>,
     clipboard: Mutex<ClipboardSyncEngine>,
@@ -411,6 +414,7 @@ fn initialize_app_state() -> Result<AppState> {
     let data_root = AppPaths::from_project_dirs()?.root().to_path_buf();
     let runtime = Runtime::new().context("create tokio runtime for app-desktop")?;
     let paths = AppPaths::from_root(data_root.clone());
+    let config = load_or_create_config(&paths)?;
     let identity = load_or_create_identity(&paths, &default_display_name())?;
     let topology = load_or_create_topology(&paths, identity.device_id, &identity.display_name)?;
     let trust_store = load_trust_store(&paths)?;
@@ -475,17 +479,26 @@ fn initialize_app_state() -> Result<AppState> {
         owns_core_service,
         core_join: Mutex::new(join),
         data_paths: paths,
+        config: Mutex::new(config.clone()),
         health: Mutex::new(AppHealth {
             protocol_version,
             discovery_port: DISCOVERY_PORT,
             session_port: SESSION_PORT,
             topology_version: topology.version,
-            clipboard_enabled: true,
-            auto_discovery_enabled: true,
+            clipboard_enabled: config.clipboard_enabled,
+            auto_discovery_enabled: config.auto_discovery_enabled,
         }),
         topology: Mutex::new(topology),
-        clipboard: Mutex::new(ClipboardSyncEngine::new(identity.device_id)),
-        tuning: Mutex::new(InputTuningProfile::default()),
+        clipboard: Mutex::new({
+            let mut clipboard = ClipboardSyncEngine::new(identity.device_id);
+            clipboard.set_enabled(config.clipboard_enabled);
+            clipboard
+        }),
+        tuning: Mutex::new(InputTuningProfile {
+            pointer_speed_multiplier: config.input_tuning.pointer_speed_multiplier,
+            wheel_speed_multiplier: config.input_tuning.wheel_speed_multiplier,
+            wheel_smoothing_factor: config.input_tuning.wheel_smoothing_factor,
+        }),
         transfer_records: Mutex::new(Vec::new()),
         managed_devices: Mutex::new(managed_devices),
         tray_status: Mutex::new("foreground".into()),
@@ -796,6 +809,15 @@ fn set_clipboard_enabled(
         health.clipboard_enabled = enabled;
     }
 
+    {
+        let mut config = state
+            .config
+            .lock()
+            .map_err(|_| "failed to access app config".to_string())?;
+        config.clipboard_enabled = enabled;
+        save_config(&state.data_paths, &config).map_err(|error| error.to_string())?;
+    }
+
     Ok(ClipboardStateDto {
         enabled: clipboard.enabled(),
         local_device_id: clipboard.local_device_id().to_string(),
@@ -980,15 +1002,27 @@ fn update_input_tuning(
     state: tauri::State<'_, AppState>,
     request: InputTuningRequest,
 ) -> Result<InputTuningDto, String> {
-    let mut tuning = state
-        .tuning
-        .lock()
-        .map_err(|_| "failed to access input tuning".to_string())?;
-    *tuning = InputTuningProfile {
+    let next = InputTuningProfile {
         pointer_speed_multiplier: request.pointer_speed_multiplier.clamp(0.25, 3.0),
         wheel_speed_multiplier: request.wheel_speed_multiplier.clamp(0.25, 3.0),
         wheel_smoothing_factor: request.wheel_smoothing_factor.clamp(0.0, 0.95),
     };
+    let mut tuning = state
+        .tuning
+        .lock()
+        .map_err(|_| "failed to access input tuning".to_string())?;
+    *tuning = next;
+
+    {
+        let mut config = state
+            .config
+            .lock()
+            .map_err(|_| "failed to access app config".to_string())?;
+        config.input_tuning.pointer_speed_multiplier = next.pointer_speed_multiplier;
+        config.input_tuning.wheel_speed_multiplier = next.wheel_speed_multiplier;
+        config.input_tuning.wheel_smoothing_factor = next.wheel_smoothing_factor;
+        save_config(&state.data_paths, &config).map_err(|error| error.to_string())?;
+    }
 
     Ok(InputTuningDto {
         pointer_speed_multiplier: tuning.pointer_speed_multiplier,
@@ -1025,12 +1059,38 @@ fn create_transfer_plan(
             .map_err(|error| error.to_string())?,
     );
     let record = execute_memory_transfer(plan).map_err(|error| error.to_string())?;
+    persist_transfer_artifacts(&state.data_paths, &record).map_err(|error| error.to_string())?;
     state
         .transfer_records
         .lock()
         .map_err(|_| "failed to access transfer records".to_string())?
         .push(record.clone());
     Ok(record)
+}
+
+fn persist_transfer_artifacts(paths: &AppPaths, record: &TransferRecord) -> Result<()> {
+    paths.ensure_layout()?;
+    let transfer_dir = paths
+        .transfers_dir()
+        .join(record.plan.manifest.transfer_id.to_string());
+    fs::create_dir_all(&transfer_dir).context("create transfer artifact directory")?;
+
+    let summary_path = transfer_dir.join("transfer-record.json");
+    let summary = serde_json::to_string_pretty(record).context("serialize transfer record")?;
+    fs::write(&summary_path, summary).context("write transfer record summary")?;
+
+    for descriptor in &record.plan.manifest.files {
+        let file_path = transfer_dir.join(&descriptor.name);
+        let bytes = deterministic_transfer_bytes(descriptor.file_id, descriptor.size_bytes)?;
+        fs::write(file_path, bytes).with_context(|| {
+            format!(
+                "write generated transfer payload for {}",
+                descriptor.name
+            )
+        })?;
+    }
+
+    Ok(())
 }
 
 #[tauri::command]

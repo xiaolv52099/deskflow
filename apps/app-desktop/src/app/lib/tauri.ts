@@ -101,6 +101,16 @@ export interface RuntimeOverview {
     clipboard_enabled: boolean;
     auto_discovery_enabled: boolean;
   };
+  input_status?: {
+    platform: string;
+    capture_ready: boolean;
+    injection_ready: boolean;
+    cursor_query_ready: boolean;
+    permission_state: string;
+    note: string;
+  };
+  clipboard_enabled?: boolean;
+  tuning?: InputTuningDto;
   tray_status: string;
   boot_error?: string | null;
 }
@@ -116,6 +126,15 @@ export interface PairingConnectResultDto {
 export interface LogPreviewDto {
   log_path: string;
   lines: string[];
+}
+
+export interface DiagnosticExportDto {
+  path: string;
+  metrics: {
+    name: string;
+    value: string;
+    status: string;
+  }[];
 }
 
 export async function getDeviceProfile() {
@@ -195,4 +214,8 @@ export async function getRuntimeOverview() {
 
 export async function getLogPreview() {
   return invoke<LogPreviewDto>("get_log_preview");
+}
+
+export async function exportDiagnostics() {
+  return invoke<DiagnosticExportDto>("export_diagnostics");
 }

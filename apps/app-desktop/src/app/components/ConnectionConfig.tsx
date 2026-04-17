@@ -11,6 +11,7 @@ import {
   Server,
 } from "lucide-react";
 import {
+  connectToManualEndpoint,
   createPairingOffer,
   getDeviceManagementSnapshot,
   getDeviceProfile,
@@ -19,7 +20,6 @@ import {
   placeTopologyDevice,
   trustDiscoveredPeer,
   updateDeviceProfile,
-  connectToManualEndpoint,
   type DeviceManagementSnapshot,
   type DeviceProfileDto,
   type DiscoveryPeer,
@@ -49,7 +49,7 @@ function ScreenBox({ id, name, isMaster, position }: ScreenBoxProps) {
       ref={(node) => {
         drag(node);
       }}
-      className={`flex h-full w-full cursor-grab flex-col items-center justify-center rounded-lg border p-1 shadow-sm transition-all active:cursor-grabbing select-none ${
+      className={`flex h-full w-full cursor-grab select-none flex-col items-center justify-center rounded-lg border p-1 shadow-sm transition-all active:cursor-grabbing ${
         isMaster
           ? "border-blue-500 bg-blue-900/60 text-blue-100 shadow-blue-900/20"
           : "border-slate-600 bg-slate-800 text-slate-200 hover:border-slate-500"
@@ -110,6 +110,15 @@ function formatError(error: unknown) {
   return String(error);
 }
 
+function deviceStatusLabel(status: string) {
+  const normalized = status.toLowerCase();
+  if (normalized === "online") return "在线";
+  if (normalized === "offline") return "离线";
+  if (normalized === "revoked") return "已撤销";
+  if (normalized === "reconnecting") return "重连中";
+  return status;
+}
+
 export function ConnectionConfig() {
   const [isMaster, setIsMaster] = useState(true);
   const [copied, setCopied] = useState<string | null>(null);
@@ -124,7 +133,7 @@ export function ConnectionConfig() {
   const [topology, setTopology] = useState<TopologySnapshot | null>(null);
   const [deviceManagement, setDeviceManagement] = useState<DeviceManagementSnapshot | null>(null);
   const [discoveredPeers, setDiscoveredPeers] = useState<DiscoveryPeer[]>([]);
-  const [statusText, setStatusText] = useState("正在初始化...");
+  const [statusText, setStatusText] = useState("正在初始化服务...");
   const [error, setError] = useState("");
 
   async function refresh() {
@@ -135,6 +144,7 @@ export function ConnectionConfig() {
       listDiscoveredPeers(),
       createPairingOffer(),
     ]);
+
     setProfile(nextProfile);
     setMachineName(nextProfile.display_name);
     setHost(nextProfile.lan_ip);
@@ -143,11 +153,11 @@ export function ConnectionConfig() {
     setTopology(nextTopology);
     setDeviceManagement(nextDevices);
     setDiscoveredPeers(nextPeers);
-    setStatusText(`运行中，监听 ${nextProfile.lan_ip}:${nextProfile.session_port}`);
+    setStatusText(`服务运行中，监听 ${nextProfile.lan_ip}:${nextProfile.session_port}`);
   }
 
   useEffect(() => {
-    void refresh().catch((error) => setError(formatError(error)));
+    void refresh().catch((nextError) => setError(formatError(nextError)));
   }, []);
 
   const screens = useMemo(() => {
@@ -174,8 +184,9 @@ export function ConnectionConfig() {
       const offer = await createPairingOffer();
       setPairingOffer(offer.payload);
       setPairingCode(offer.pairing_code);
-    } catch (error) {
-      setError(formatError(error));
+      setStatusText("已刷新本机配对信息");
+    } catch (nextError) {
+      setError(formatError(nextError));
     }
   }
 
@@ -186,8 +197,9 @@ export function ConnectionConfig() {
       setProfile(next);
       setMachineName(next.display_name);
       setIsEditingName(false);
-    } catch (error) {
-      setError(formatError(error));
+      setStatusText(`设备名称已更新为 ${next.display_name}`);
+    } catch (nextError) {
+      setError(formatError(nextError));
     }
   }
 
@@ -199,8 +211,9 @@ export function ConnectionConfig() {
       const y = Math.floor(newPosition / topology.grid_width);
       const next = await placeTopologyDevice(id, { x, y });
       setTopology(next);
-    } catch (error) {
-      setError(formatError(error));
+      setStatusText("屏幕布局已更新");
+    } catch (nextError) {
+      setError(formatError(nextError));
     }
   }
 
@@ -213,8 +226,9 @@ export function ConnectionConfig() {
       setTopology(nextTopology);
       const nextPeers = await listDiscoveredPeers();
       setDiscoveredPeers(nextPeers);
-    } catch (error) {
-      setError(formatError(error));
+      setStatusText(`已信任设备 ${peer.display_name}`);
+    } catch (nextError) {
+      setError(formatError(nextError));
     }
   }
 
@@ -226,9 +240,9 @@ export function ConnectionConfig() {
       setDeviceManagement(result.device_management);
       const nextTopology = await getTopologySnapshot();
       setTopology(nextTopology);
-      setStatusText(`已写入配对配置 ${result.endpoint_host}:${result.session_port}`);
-    } catch (error) {
-      setError(formatError(error));
+      setStatusText(`已写入手动配对配置 ${result.endpoint_host}:${result.session_port}`);
+    } catch (nextError) {
+      setError(formatError(nextError));
     }
   }
 
@@ -239,14 +253,18 @@ export function ConnectionConfig() {
       <div className="flex flex-1 flex-col overflow-y-auto rounded-xl border border-slate-700/60 bg-slate-800/60 p-4 shadow-inner">
         <div className="mb-5 flex shrink-0 rounded-lg border border-slate-700 bg-slate-900 p-1 shadow-sm">
           <button
-            className={`flex-1 rounded-md py-1.5 text-xs font-medium transition-all ${isMaster ? "bg-blue-600 text-white shadow" : "text-slate-400 hover:text-white"}`}
+            className={`flex-1 rounded-md py-1.5 text-xs font-medium transition-all ${
+              isMaster ? "bg-blue-600 text-white shadow" : "text-slate-400 hover:text-white"
+            }`}
             onClick={() => setIsMaster(true)}
             type="button"
           >
             主控端
           </button>
           <button
-            className={`flex-1 rounded-md py-1.5 text-xs font-medium transition-all ${!isMaster ? "bg-blue-600 text-white shadow" : "text-slate-400 hover:text-white"}`}
+            className={`flex-1 rounded-md py-1.5 text-xs font-medium transition-all ${
+              !isMaster ? "bg-blue-600 text-white shadow" : "text-slate-400 hover:text-white"
+            }`}
             onClick={() => setIsMaster(false)}
             type="button"
           >
@@ -258,12 +276,13 @@ export function ConnectionConfig() {
           <div className="flex flex-1 flex-col justify-center space-y-3">
             <div>
               <h3 className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-white">
-                <Server className="text-blue-400" size={14} /> 本机网络信息
+                <Server className="text-blue-400" size={14} />
+                本机网络信息
               </h3>
               <div className="space-y-1.5">
                 <div className="flex items-center justify-between rounded-lg border border-slate-700/60 bg-slate-900/80 p-2">
                   <div className="mr-2 flex-1">
-                    <span className="mb-0.5 block text-[10px] text-slate-500">本机名称</span>
+                    <span className="mb-0.5 block text-[10px] text-slate-500">设备名称</span>
                     {isEditingName ? (
                       <div className="flex items-center gap-2">
                         <input
@@ -327,7 +346,7 @@ export function ConnectionConfig() {
             </div>
 
             <div className="pt-1">
-              <h3 className="mb-2 text-xs font-semibold text-white">动态配对密钥</h3>
+              <h3 className="mb-2 text-xs font-semibold text-white">动态配对码</h3>
               <div className="flex items-center justify-between rounded-lg border border-slate-700/60 bg-slate-900/80 p-2.5">
                 <span className="font-mono text-sm font-bold tracking-widest text-emerald-400">{pairingCode || "----"}</span>
                 <div className="flex gap-1.5">
@@ -342,7 +361,7 @@ export function ConnectionConfig() {
                   <button
                     className="rounded-md bg-slate-800 p-1.5 text-slate-400 transition-colors hover:bg-slate-700 hover:text-white"
                     onClick={() => pairingOffer && void handleCopy(pairingOffer, "payload")}
-                    title="复制配对串"
+                    title="复制完整配对信息"
                     type="button"
                   >
                     {copied === "payload" ? <CheckCircle2 className="text-emerald-500" size={14} /> : <Copy size={14} />}
@@ -354,10 +373,10 @@ export function ConnectionConfig() {
             {discoveredPeers.length > 0 ? (
               <div className="space-y-1 rounded-lg border border-slate-700/60 bg-slate-900/70 p-2">
                 <div className="text-[10px] text-slate-400">自动发现设备</div>
-                {discoveredPeers.slice(0, 2).map((peer) => (
+                {discoveredPeers.slice(0, 4).map((peer) => (
                   <div className="flex items-center justify-between rounded-md bg-slate-800/70 px-2 py-1" key={peer.device_id}>
-                    <div>
-                      <div className="text-[11px] text-slate-200">{peer.display_name}</div>
+                    <div className="min-w-0">
+                      <div className="truncate text-[11px] text-slate-200">{peer.display_name}</div>
                       <div className="text-[10px] text-slate-500">
                         {peer.address}:{peer.port}
                       </div>
@@ -373,6 +392,24 @@ export function ConnectionConfig() {
                   </div>
                 ))}
               </div>
+            ) : (
+              <div className="rounded-lg border border-dashed border-slate-700/60 bg-slate-900/40 p-3 text-[10px] text-slate-400">
+                暂未发现其他局域网设备，请确认双方已启动应用且处于同一网段。
+              </div>
+            )}
+
+            {deviceManagement?.devices.length ? (
+              <div className="space-y-1 rounded-lg border border-slate-700/60 bg-slate-900/70 p-2">
+                <div className="text-[10px] text-slate-400">已配对设备</div>
+                {deviceManagement.devices.map((device) => (
+                  <div className="flex items-center justify-between rounded-md bg-slate-800/70 px-2 py-1" key={device.device_id}>
+                    <div className="min-w-0">
+                      <div className="truncate text-[11px] text-slate-200">{device.display_name}</div>
+                      <div className="text-[10px] text-slate-500">{deviceStatusLabel(device.status)}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
             ) : null}
 
             <div className="mt-auto rounded-md border border-emerald-500/20 bg-emerald-400/10 p-2 text-[10px] text-emerald-400">
@@ -383,8 +420,10 @@ export function ConnectionConfig() {
           <div className="flex flex-1 flex-col justify-center space-y-4">
             <div>
               <h3 className="mb-3 flex items-center gap-1.5 text-xs font-semibold text-white">
-                <Server className="text-blue-400" size={14} /> 连接到主服务端
+                <Server className="text-blue-400" size={14} />
+                连接到主控端
               </h3>
+              <p className="text-[10px] text-slate-400">输入主控端 IP、端口和配对码，建立可信连接。</p>
             </div>
 
             <div className="space-y-3">
@@ -410,11 +449,11 @@ export function ConnectionConfig() {
               </div>
 
               <div className="space-y-1">
-                <label className="text-[10px] text-slate-400">配对密钥</label>
+                <label className="text-[10px] text-slate-400">配对码</label>
                 <input
                   className="w-full rounded-md border border-slate-700 bg-slate-900 px-2.5 py-1.5 font-mono text-xs font-bold uppercase tracking-widest text-emerald-400 transition-all focus:border-blue-500 focus:outline-none"
                   onChange={(event) => setManualPairingCode(event.target.value)}
-                  placeholder="XXXX-XXXX-XXXX-XXXX"
+                  placeholder="XXXXXX"
                   value={manualPairingCode}
                 />
               </div>
@@ -435,15 +474,15 @@ export function ConnectionConfig() {
 
       {isMaster ? (
         <div className="relative flex flex-1 flex-col overflow-hidden rounded-xl border border-slate-700/60 bg-slate-800/60 p-4 shadow-inner">
-          <h3 className="mb-1 text-xs font-semibold text-white">屏幕拓扑结构</h3>
-          <p className="mb-4 text-[10px] text-slate-400">拖拽屏幕以调整相对物理布局和跨越边界。</p>
+          <h3 className="mb-1 text-xs font-semibold text-white">屏幕拓扑布局</h3>
+          <p className="mb-4 text-[10px] text-slate-400">拖拽设备到 3 x 3 网格中，确定副屏相对主屏的位置关系。</p>
 
           <div className="flex flex-1 flex-col items-center justify-center">
             <div className="relative">
-              <div className="absolute -top-4 left-1/2 -translate-x-1/2 transform text-[9px] text-slate-600">上方边界</div>
-              <div className="absolute -bottom-4 left-1/2 -translate-x-1/2 transform text-[9px] text-slate-600">下方边界</div>
-              <div className="absolute top-1/2 -left-7 -translate-y-1/2 -rotate-90 transform whitespace-nowrap text-[9px] text-slate-600">左侧边界</div>
-              <div className="absolute top-1/2 -right-7 -translate-y-1/2 rotate-90 transform whitespace-nowrap text-[9px] text-slate-600">右侧边界</div>
+              <div className="absolute -top-4 left-1/2 -translate-x-1/2 transform text-[9px] text-slate-600">上边界</div>
+              <div className="absolute -bottom-4 left-1/2 -translate-x-1/2 transform text-[9px] text-slate-600">下边界</div>
+              <div className="absolute top-1/2 -left-7 -translate-y-1/2 -rotate-90 transform whitespace-nowrap text-[9px] text-slate-600">左边界</div>
+              <div className="absolute top-1/2 -right-7 -translate-y-1/2 rotate-90 transform whitespace-nowrap text-[9px] text-slate-600">右边界</div>
 
               <div className="grid grid-cols-3 gap-2 rounded-2xl border border-slate-700/30 bg-slate-900/30 p-3">
                 {Array.from({ length: 9 }).map((_, pos) => {
