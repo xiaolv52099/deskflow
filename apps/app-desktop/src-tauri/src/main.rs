@@ -12,10 +12,10 @@ use core_input::{
 use core_protocol::{DeviceDescriptor, PairingCode};
 use core_service::run_core_service;
 use core_session::{
-    apply_device_repair, build_client_tls_config, managed_devices_from_trust_store,
-    manual_endpoint, process_pairing_request, schedule_device_reconnect, session_descriptor,
-    DeviceRepairAction, ManagedDevice, ManagedDeviceStatus, PairingDecision, PairingRequest,
-    DEFAULT_OFFLINE_AFTER_MS, DISCOVERY_PORT, SESSION_PORT,
+    apply_device_repair, managed_devices_from_trust_store, manual_endpoint,
+    process_pairing_request, schedule_device_reconnect, session_descriptor, DeviceRepairAction,
+    ManagedDevice, ManagedDeviceStatus, PairingDecision, PairingRequest, DEFAULT_OFFLINE_AFTER_MS,
+    DISCOVERY_PORT, SESSION_PORT,
 };
 use core_topology::{
     apply_hot_update, load_or_create_topology, save_topology, GridPosition, TopologyLayout,
@@ -2101,8 +2101,7 @@ fn execute_remote_transfer(
         source_display_name: local_identity.display_name,
     };
 
-    let client_config = std::sync::Arc::new(build_client_tls_config(paths, remote)?);
-    let stream = std::net::TcpStream::connect((remote.address.as_str(), remote.port))
+    let mut stream = std::net::TcpStream::connect((remote.address.as_str(), remote.port))
         .with_context(|| {
             format!(
                 "connect remote transfer session {}:{}",
@@ -2116,18 +2115,15 @@ fn execute_remote_transfer(
     stream
         .set_write_timeout(transfer_timeout)
         .context("set transfer write timeout")?;
-    let server_name = rustls::pki_types::ServerName::try_from(remote.device_id.clone())
-        .map_err(|_| anyhow::anyhow!("invalid remote server name"))?;
-    let connection = rustls::ClientConnection::new(client_config, server_name)
-        .context("create transfer client tls connection")?;
-    let mut tls = rustls::StreamOwned::new(connection, stream);
     let session_raw = serde_json::to_vec(&header).context("serialize transfer session header")?;
-    tls.write_all(&(session_raw.len() as u64).to_be_bytes())
+    stream
+        .write_all(&(session_raw.len() as u64).to_be_bytes())
         .context("write transfer session header length")?;
-    tls.write_all(&session_raw)
+    stream
+        .write_all(&session_raw)
         .context("write transfer session header payload")?;
 
-    let mut writer = BufWriter::new(tls);
+    let mut writer = BufWriter::new(stream);
     for (descriptor, file) in plan.manifest.files.iter().zip(files.iter()) {
         let mut reader = BufReader::new(
             fs::File::open(&file.source_path)
@@ -2186,18 +2182,20 @@ fn execute_remote_transfer(
         .write_all(&0u64.to_be_bytes())
         .context("write transfer end marker")?;
     writer.flush().context("flush transfer payload")?;
-    let mut tls = writer
+    let mut stream = writer
         .into_inner()
-        .map_err(|error| anyhow::anyhow!("extract transfer tls stream: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("extract transfer stream: {error}"))?;
     let mut length_bytes = [0u8; 8];
-    tls.read_exact(&mut length_bytes)
+    stream
+        .read_exact(&mut length_bytes)
         .context("read transfer ack length")?;
     let ack_len = u64::from_be_bytes(length_bytes);
     if ack_len == 0 || ack_len > MAX_TRANSFER_ACK_BYTES {
         anyhow::bail!("invalid transfer ack length: {ack_len}");
     }
     let mut ack_bytes = vec![0u8; ack_len as usize];
-    tls.read_exact(&mut ack_bytes)
+    stream
+        .read_exact(&mut ack_bytes)
         .context("read transfer ack payload")?;
     let ack: TransferDeliveryAck =
         serde_json::from_slice(&ack_bytes).context("parse transfer ack payload")?;

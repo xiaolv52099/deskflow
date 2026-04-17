@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use core_file_transfer::{checksum_sha256, TransferPlan, TransferProgress};
 use core_protocol::{negotiate_protocol, ProtocolFrame, ProtocolMessage, VersionNegotiation};
 use core_session::{
-    bind_discovery_socket, build_server_tls_config, manual_endpoint, process_pairing_request,
-    session_descriptor, PairingDecision, PairingRequest, DISCOVERY_PORT, SESSION_PORT,
+    bind_discovery_socket, manual_endpoint, process_pairing_request, session_descriptor,
+    PairingDecision, PairingRequest, DISCOVERY_PORT, SESSION_PORT,
 };
 use core_topology::load_or_create_topology;
 use device_trust::{
@@ -22,7 +22,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufWriter, Read, Write};
 use std::net::TcpListener;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UdpSocket};
@@ -60,7 +59,7 @@ struct TransferRecord {
 
 fn persist_transfer_stream(
     paths: &AppPaths,
-    tls: &mut rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>,
+    stream: &mut std::net::TcpStream,
     session: TransferSessionHeader,
 ) -> Result<TransferDeliveryAck> {
     paths.ensure_layout()?;
@@ -86,7 +85,8 @@ fn persist_transfer_stream(
 
     loop {
         let mut chunk_length_bytes = [0u8; 8];
-        tls.read_exact(&mut chunk_length_bytes)
+        stream
+            .read_exact(&mut chunk_length_bytes)
             .context("read transfer chunk header length")?;
         let chunk_header_len = u64::from_be_bytes(chunk_length_bytes);
         if chunk_header_len == 0 {
@@ -97,7 +97,8 @@ fn persist_transfer_stream(
         }
 
         let mut chunk_header_raw = vec![0u8; chunk_header_len as usize];
-        tls.read_exact(&mut chunk_header_raw)
+        stream
+            .read_exact(&mut chunk_header_raw)
             .context("read transfer chunk header payload")?;
         let chunk_header: TransferChunkHeader =
             serde_json::from_slice(&chunk_header_raw).context("parse transfer chunk header")?;
@@ -114,7 +115,8 @@ fn persist_transfer_stream(
         }
 
         let mut chunk_bytes = vec![0u8; chunk_header.size_bytes as usize];
-        tls.read_exact(&mut chunk_bytes)
+        stream
+            .read_exact(&mut chunk_bytes)
             .context("read transfer chunk payload")?;
         let actual_checksum = checksum_sha256(&chunk_bytes);
         if actual_checksum != chunk_header.checksum_sha256 {
@@ -589,31 +591,31 @@ fn run_transfer_listener(listener: TcpListener, paths: AppPaths) -> Result<()> {
 }
 
 fn handle_transfer_connection(stream: std::net::TcpStream, paths: &AppPaths) -> Result<()> {
-    let server_config = Arc::new(build_server_tls_config(paths)?);
-    let connection = rustls::ServerConnection::new(server_config)
-        .context("create transfer server tls connection")?;
-    let mut tls = rustls::StreamOwned::new(connection, stream);
+    let mut stream = stream;
 
     let mut length_bytes = [0u8; 8];
-    tls.read_exact(&mut length_bytes)
+    stream
+        .read_exact(&mut length_bytes)
         .context("read transfer session header length")?;
     let payload_len = u64::from_be_bytes(length_bytes);
     if payload_len == 0 || payload_len > MAX_TRANSFER_SESSION_HEADER_BYTES {
         anyhow::bail!("invalid transfer session header length: {payload_len}");
     }
     let mut payload = vec![0u8; payload_len as usize];
-    tls.read_exact(&mut payload)
+    stream
+        .read_exact(&mut payload)
         .context("read transfer session header body")?;
 
     let session: TransferSessionHeader =
         serde_json::from_slice(&payload).context("parse received transfer session header")?;
-    let ack = persist_transfer_stream(paths, &mut tls, session)
+    let ack = persist_transfer_stream(paths, &mut stream, session)
         .context("persist received transfer artifacts")?;
     let ack_raw = serde_json::to_vec(&ack).context("serialize transfer ack")?;
-    tls.write_all(&(ack_raw.len() as u64).to_be_bytes())
+    stream
+        .write_all(&(ack_raw.len() as u64).to_be_bytes())
         .context("write transfer ack length")?;
-    tls.write_all(&ack_raw).context("write transfer ack")?;
-    tls.flush().context("flush transfer ack")?;
+    stream.write_all(&ack_raw).context("write transfer ack")?;
+    stream.flush().context("flush transfer ack")?;
     Ok(())
 }
 
