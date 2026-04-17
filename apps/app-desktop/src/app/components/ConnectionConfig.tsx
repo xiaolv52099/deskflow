@@ -163,7 +163,7 @@ export function ConnectionConfig() {
 
     setProfile(nextProfile);
     setMachineName(nextProfile.display_name);
-    if (!host || host === "127.0.0.1" || host === "localhost") {
+    if (!host) {
       setHost(nextProfile.lan_ip);
     }
     setPairingCode(nextOffer.pairing_code);

@@ -24,7 +24,7 @@ use device_trust::{
 };
 use foundation::{
     append_log, export_extended_diagnostic_snapshot, load_discovery_peers, load_or_create_config,
-    load_pending_pairing_requests, read_recent_log_lines, save_config, save_pending_pairing_requests,
+    load_pending_pairing_requests, read_recent_log_lines, save_config, save_discovery_peers, save_pending_pairing_requests,
     AppConfig, AppPaths, DiagnosticMetric, DiscoveryPeer, DATA_ROOT_ENV_VAR,
 };
 use local_ipc::{send_command, CoreToUiEvent, UiToCoreCommand};
@@ -820,6 +820,9 @@ fn set_controller_service_enabled(
         }
         save_config(&state.data_paths, &config).map_err(|error| error.to_string())?;
     }
+    if !enabled {
+        save_discovery_peers(&state.data_paths, &[]).map_err(|error| error.to_string())?;
+    }
 
     {
         let mut health = state
@@ -881,6 +884,24 @@ fn submit_discovery_pairing_request(
     socket
         .send_to(&frame, format!("{}:{}", peer.address, DISCOVERY_PORT))
         .map_err(|error| error.to_string())?;
+
+    {
+        let mut config = state
+            .config
+            .lock()
+            .map_err(|_| "failed to access app config".to_string())?;
+        config.app_role = "client".into();
+        config.active_peer_device_id = Some(peer.device_id.clone());
+        save_config(&state.data_paths, &config).map_err(|error| error.to_string())?;
+    }
+    {
+        let mut health = state
+            .health
+            .lock()
+            .map_err(|_| "failed to access app health".to_string())?;
+        health.app_role = "client".into();
+        health.active_peer_device_id = Some(peer.device_id.clone());
+    }
 
     Ok(pairing_code)
 }

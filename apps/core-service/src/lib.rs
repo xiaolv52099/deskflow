@@ -140,7 +140,11 @@ async fn run_discovery_loop(
                     unix_time_now_ms().saturating_sub(peer.discovered_at_unix_ms) <= DISCOVERY_PEER_TTL_MS
                 });
                 save_discovery_peers(&paths, &peers.values().cloned().collect::<Vec<_>>())?;
-                let _ = socket.send_to(&announce, &broadcast_addr).await;
+                if let Ok(config) = load_or_create_config(&paths) {
+                    if config.app_role == "controller" && config.controller_service_enabled {
+                        let _ = socket.send_to(&announce, &broadcast_addr).await;
+                    }
+                }
             }
             received = socket.recv_from(&mut buffer) => {
                 let (len, addr) = received?;
