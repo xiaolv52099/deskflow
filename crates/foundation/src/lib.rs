@@ -17,6 +17,7 @@ pub const TRUST_STORE_FILE_NAME: &str = "trust-store.json";
 pub const TOPOLOGY_FILE_NAME: &str = "topology.json";
 pub const DISCOVERY_FILE_NAME: &str = "discovery.json";
 pub const PAIRING_REQUESTS_FILE_NAME: &str = "pairing-requests.json";
+pub const PAIRED_PEERS_FILE_NAME: &str = "paired-peers.json";
 pub const TRANSFERS_DIR_NAME: &str = "transfers";
 pub const DATA_ROOT_ENV_VAR: &str = "DESKFLOW_PLUS_DATA_ROOT";
 
@@ -108,6 +109,18 @@ pub struct PendingPairingRequest {
     pub certificate_pem: String,
     pub pairing_code: String,
     pub received_at_unix_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CachedPeerDescriptor {
+    pub device_id: String,
+    pub display_name: String,
+    pub platform: String,
+    pub address: String,
+    pub port: u16,
+    pub fingerprint_sha256: String,
+    pub certificate_pem: String,
+    pub updated_at_unix_ms: u128,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -221,6 +234,10 @@ impl AppPaths {
 
     pub fn pairing_requests_file(&self) -> PathBuf {
         self.discovery_dir().join(PAIRING_REQUESTS_FILE_NAME)
+    }
+
+    pub fn paired_peers_file(&self) -> PathBuf {
+        self.discovery_dir().join(PAIRED_PEERS_FILE_NAME)
     }
 
     pub fn ensure_layout(&self) -> Result<()> {
@@ -345,6 +362,40 @@ pub fn save_pending_pairing_requests(
     let raw = serde_json::to_string_pretty(requests).context("serialize pending pairing requests")?;
     fs::write(paths.pairing_requests_file(), raw).context("write pending pairing requests")?;
     Ok(())
+}
+
+pub fn load_cached_peer_descriptors(paths: &AppPaths) -> Result<Vec<CachedPeerDescriptor>> {
+    paths.ensure_layout()?;
+    let path = paths.paired_peers_file();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let raw = fs::read_to_string(&path).context("read paired peer descriptors")?;
+    serde_json::from_str(&raw).context("parse paired peer descriptors")
+}
+
+pub fn save_cached_peer_descriptors(paths: &AppPaths, peers: &[CachedPeerDescriptor]) -> Result<()> {
+    paths.ensure_layout()?;
+    let raw = serde_json::to_string_pretty(peers).context("serialize paired peer descriptors")?;
+    fs::write(paths.paired_peers_file(), raw).context("write paired peer descriptors")?;
+    Ok(())
+}
+
+pub fn upsert_cached_peer_descriptor(paths: &AppPaths, peer: CachedPeerDescriptor) -> Result<()> {
+    let mut peers = load_cached_peer_descriptors(paths)?;
+    if let Some(existing) = peers.iter_mut().find(|item| item.device_id == peer.device_id) {
+        *existing = peer;
+    } else {
+        peers.push(peer);
+    }
+    save_cached_peer_descriptors(paths, &peers)
+}
+
+pub fn remove_cached_peer_descriptor(paths: &AppPaths, device_id: &str) -> Result<()> {
+    let mut peers = load_cached_peer_descriptors(paths)?;
+    peers.retain(|peer| peer.device_id != device_id);
+    save_cached_peer_descriptors(paths, &peers)
 }
 
 pub fn read_recent_log_lines(paths: &AppPaths, limit: usize) -> Result<Vec<String>> {

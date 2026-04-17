@@ -8,9 +8,9 @@ use core_session::{
 use core_topology::load_or_create_topology;
 use device_trust::{default_display_name, load_or_create_certificate, load_or_create_identity};
 use foundation::{
-    append_log, export_diagnostic_snapshot, init_tracing, load_discovery_peers,
-    load_or_create_config, load_pending_pairing_requests, save_discovery_peers,
-    save_pending_pairing_requests, AppPaths, DiscoveryPeer, PendingPairingRequest,
+    append_log, export_diagnostic_snapshot, init_tracing, load_discovery_peers, load_or_create_config,
+    load_pending_pairing_requests, save_discovery_peers, save_pending_pairing_requests, upsert_cached_peer_descriptor,
+    AppPaths, CachedPeerDescriptor, DiscoveryPeer, PendingPairingRequest,
 };
 use local_ipc::bind_listener;
 use serde::{Deserialize, Serialize};
@@ -47,6 +47,7 @@ struct TransferRecord {
     delivery_message: Option<String>,
     #[serde(default)]
     confirmed_at_unix_ms: Option<u128>,
+    #[serde(default)]
     error: Option<String>,
 }
 
@@ -296,6 +297,19 @@ async fn run_discovery_loop(
                                 },
                             };
                             process_pairing_request(&paths, pairing_request, PairingDecision::Accept)?;
+                            upsert_cached_peer_descriptor(
+                                &paths,
+                                CachedPeerDescriptor {
+                                    device_id: peer.device_id.clone(),
+                                    display_name: peer.display_name.clone(),
+                                    platform: peer.platform.clone(),
+                                    address: peer.address.clone(),
+                                    port: peer.port,
+                                    fingerprint_sha256: peer.fingerprint_sha256.clone(),
+                                    certificate_pem: peer.certificate_pem.clone(),
+                                    updated_at_unix_ms: unix_time_now_ms(),
+                                },
+                            )?;
                             let mut config = load_or_create_config(&paths)?;
                             config.app_role = "client".into();
                             config.active_peer_device_id = Some(peer.device_id);

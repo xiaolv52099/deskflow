@@ -23,9 +23,10 @@ use device_trust::{
     revoke_trusted_device, save_identity,
 };
 use foundation::{
-    append_log, export_extended_diagnostic_snapshot, load_discovery_peers, load_or_create_config,
-    load_pending_pairing_requests, read_recent_log_lines, save_config, save_discovery_peers, save_pending_pairing_requests,
-    AppConfig, AppPaths, DiagnosticMetric, DiscoveryPeer, DATA_ROOT_ENV_VAR,
+    append_log, export_extended_diagnostic_snapshot, load_cached_peer_descriptors, load_discovery_peers,
+    load_or_create_config, load_pending_pairing_requests, read_recent_log_lines, remove_cached_peer_descriptor,
+    save_config, save_discovery_peers, save_pending_pairing_requests, upsert_cached_peer_descriptor, AppConfig,
+    AppPaths, CachedPeerDescriptor, DiagnosticMetric, DiscoveryPeer, DATA_ROOT_ENV_VAR,
 };
 use local_ipc::{send_command, CoreToUiEvent, UiToCoreCommand};
 use serde::{Deserialize, Serialize};
@@ -272,6 +273,7 @@ struct TransferRecord {
     delivery_message: Option<String>,
     #[serde(default)]
     confirmed_at_unix_ms: Option<u128>,
+    #[serde(default)]
     error: Option<String>,
 }
 
@@ -1065,6 +1067,20 @@ fn respond_to_pending_pairing(
         };
         process_pairing_request(&state.data_paths, pairing_request, PairingDecision::Accept)
             .map_err(|error| error.to_string())?;
+        upsert_cached_peer_descriptor(
+            &state.data_paths,
+            CachedPeerDescriptor {
+                device_id: target.device_id.clone(),
+                display_name: target.display_name.clone(),
+                platform: target.platform.clone(),
+                address: target.address.clone(),
+                port: target.port,
+                fingerprint_sha256: target.fingerprint_sha256.clone(),
+                certificate_pem: target.certificate_pem.clone(),
+                updated_at_unix_ms: unix_time_now_ms(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
         sync_topology_with_trusted_devices(&state)?;
 
         {
@@ -1458,6 +1474,20 @@ fn connect_to_manual_endpoint(
         };
         process_pairing_request(&state.data_paths, pairing_request, PairingDecision::Accept)
             .map_err(|error| error.to_string())?;
+        upsert_cached_peer_descriptor(
+            &state.data_paths,
+            CachedPeerDescriptor {
+                device_id: peer.device_id.clone(),
+                display_name: peer.display_name.clone(),
+                platform: peer.platform.clone(),
+                address: peer.address.clone(),
+                port: peer.port,
+                fingerprint_sha256: peer.fingerprint_sha256.clone(),
+                certificate_pem: peer.certificate_pem.clone(),
+                updated_at_unix_ms: unix_time_now_ms(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
     }
 
     {
@@ -1537,6 +1567,11 @@ fn trust_discovered_peer(
     };
     process_pairing_request(&state.data_paths, pairing_request, PairingDecision::Accept)
         .map_err(|error| error.to_string())?;
+    upsert_cached_peer_descriptor(
+        &state.data_paths,
+        descriptor_to_cached_peer(&discovery_peer_to_descriptor(&peer)),
+    )
+    .map_err(|error| error.to_string())?;
     sync_topology_with_trusted_devices(&state)?;
     get_device_management_snapshot(state)
 }
@@ -1601,11 +1636,18 @@ fn create_transfer_plan(
         .cloned()
         .ok_or_else(|| "target device is not trusted".to_string())?;
     let discovery_peers = load_discovery_peers(&state.data_paths).map_err(|error| error.to_string())?;
+    let cached_peers = load_cached_peer_descriptors(&state.data_paths).map_err(|error| error.to_string())?;
     let remote = discovery_peers
         .iter()
         .find(|peer| peer.device_id == trusted_target.device_id.to_string())
         .map(discovery_peer_to_descriptor)
-        .ok_or_else(|| "target device is not currently discoverable".to_string())?;
+        .or_else(|| {
+            cached_peers
+                .iter()
+                .find(|peer| peer.device_id == trusted_target.device_id.to_string())
+                .map(cached_peer_to_descriptor)
+        })
+        .ok_or_else(|| "target device is not currently reachable".to_string())?;
     let source_device_id = {
         let clipboard = state
             .clipboard
@@ -1728,6 +1770,8 @@ fn repair_managed_device(
     let action = parse_device_repair_action(&request.action)?;
     if action == DeviceRepairAction::Revoke {
         revoke_trusted_device(&state.data_paths, device_id).map_err(|error| error.to_string())?;
+        remove_cached_peer_descriptor(&state.data_paths, &request.device_id)
+            .map_err(|error| error.to_string())?;
         remove_device_from_topology(&state, device_id)?;
         {
             let mut config = state
@@ -1977,9 +2021,18 @@ fn load_transfer_records_from_disk(paths: &AppPaths) -> Result<Vec<TransferRecor
 
         let raw = fs::read_to_string(&summary_path)
             .with_context(|| format!("read transfer record summary from {}", summary_path.display()))?;
-        let record: TransferRecord = serde_json::from_str(&raw)
-            .with_context(|| format!("parse transfer record summary from {}", summary_path.display()))?;
-        records.push(record);
+        match serde_json::from_str::<TransferRecord>(&raw) {
+            Ok(record) => records.push(record),
+            Err(error) => {
+                let _ = append_log(
+                    paths,
+                    &format!(
+                        "skip invalid transfer record {}: {error:#}",
+                        summary_path.display()
+                    ),
+                );
+            }
+        }
     }
 
     records.sort_by_key(|record| record.created_at_unix_ms);
@@ -2085,6 +2138,31 @@ fn default_delivery_state() -> String {
 }
 
 fn discovery_peer_to_descriptor(peer: &DiscoveryPeer) -> DeviceDescriptor {
+    DeviceDescriptor {
+        device_id: peer.device_id.clone(),
+        display_name: peer.display_name.clone(),
+        platform: peer.platform.clone(),
+        address: peer.address.clone(),
+        port: peer.port,
+        fingerprint_sha256: peer.fingerprint_sha256.clone(),
+        certificate_pem: peer.certificate_pem.clone(),
+    }
+}
+
+fn descriptor_to_cached_peer(descriptor: &DeviceDescriptor) -> CachedPeerDescriptor {
+    CachedPeerDescriptor {
+        device_id: descriptor.device_id.clone(),
+        display_name: descriptor.display_name.clone(),
+        platform: descriptor.platform.clone(),
+        address: descriptor.address.clone(),
+        port: descriptor.port,
+        fingerprint_sha256: descriptor.fingerprint_sha256.clone(),
+        certificate_pem: descriptor.certificate_pem.clone(),
+        updated_at_unix_ms: unix_time_now_ms(),
+    }
+}
+
+fn cached_peer_to_descriptor(peer: &CachedPeerDescriptor) -> DeviceDescriptor {
     DeviceDescriptor {
         device_id: peer.device_id.clone(),
         display_name: peer.display_name.clone(),
