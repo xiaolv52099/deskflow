@@ -87,6 +87,12 @@ export interface TransferRecord {
   error?: string | null;
 }
 
+export interface SelectedTransferFileDto {
+  name: string;
+  path: string;
+  size_bytes: number;
+}
+
 export interface InputTuningDto {
   pointer_speed_multiplier: number;
   wheel_speed_multiplier: number;
@@ -247,7 +253,11 @@ export async function repairManagedDevice(device_id: string, action: "mark_onlin
   });
 }
 
-export async function createTransferPlan(target_device_id: string, files: { name: string; size_bytes: number; bytes: number[] }[]) {
+export async function selectTransferFiles() {
+  return invoke<SelectedTransferFileDto[]>("select_transfer_files");
+}
+
+export async function createTransferPlan(target_device_id: string, files: { name: string; path: string; size_bytes: number }[]) {
   return invoke<TransferRecord>("create_transfer_plan", {
     request: { target_device_id, files },
   });

@@ -2,7 +2,10 @@
 
 use anyhow::{Context as AnyhowContext, Result};
 use core_clipboard::{ClipboardSyncEngine, ImageClipboardFormat};
-use core_file_transfer::{approve_transfer, plan_transfer, TransferFileDescriptor, TransferPlan, TransferProgress};
+use core_file_transfer::{
+    approve_transfer, checksum_sha256, plan_transfer, TransferFileDescriptor, TransferPlan,
+    TransferProgress,
+};
 use core_input::{
     current_platform_input_status, sample_cursor_position, InputTuningProfile, PlatformInputStatus,
 };
@@ -27,12 +30,14 @@ use foundation::{
 };
 use local_ipc::{send_command, CoreToUiEvent, UiToCoreCommand};
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::fs;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::menu::{MenuBuilder, MenuEvent, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager};
+use tauri_plugin_dialog::DialogExt;
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 #[cfg(windows)]
@@ -45,7 +50,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 const DISCOVERY_PEER_TTL_MS: u128 = 8_000;
+#[cfg(windows)]
 const SINGLE_INSTANCE_MUTEX_NAME: &str = "DeskflowPlus.SingleInstance";
+#[cfg(windows)]
 const MAIN_WINDOW_TITLE: &str = "Deskflow-Plus";
 
 struct AppState {
@@ -245,7 +252,9 @@ struct TransferPlanRequest {
 #[serde(rename_all = "snake_case")]
 struct TransferFileRequest {
     name: String,
-    bytes: Vec<u8>,
+    path: String,
+    #[allow(dead_code)]
+    size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,18 +290,31 @@ struct TransferArtifactRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-struct TransferArtifactPayload {
+struct TransferSessionHeader {
     record: TransferRecord,
     source_device_id: String,
     source_display_name: String,
-    files: Vec<TransferArtifactFile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct TransferArtifactFile {
     name: String,
-    bytes: Vec<u8>,
+    source_path: PathBuf,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct TransferChunkHeader {
+    transfer_id: Uuid,
+    file_id: Uuid,
+    file_name: String,
+    chunk_index: u64,
+    offset: u64,
+    size_bytes: u64,
+    checksum_sha256: String,
+    is_last_chunk: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,6 +383,14 @@ struct LogPreviewDto {
     lines: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct SelectedTransferFileDto {
+    name: String,
+    path: String,
+    size_bytes: u64,
+}
+
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -379,6 +409,7 @@ fn main() {
     let state = initialize_app_state().expect("failed to initialize app state");
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             let _ = reveal_main_window(app);
         }))
@@ -416,6 +447,7 @@ fn main() {
             trust_discovered_peer,
             get_input_tuning,
             update_input_tuning,
+            select_transfer_files,
             create_transfer_plan,
             list_transfer_plans,
             get_transfer_artifact_path,
@@ -433,6 +465,37 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("failed to run Deskflow-Plus");
+}
+
+#[tauri::command]
+fn select_transfer_files(app: tauri::AppHandle) -> Result<Vec<SelectedTransferFileDto>, String> {
+    let Some(paths) = app.dialog().file().blocking_pick_files() else {
+        return Ok(Vec::new());
+    };
+
+    let mut selected = Vec::new();
+    for path in paths {
+        let Ok(path) = path.into_path() else {
+            continue;
+        };
+        let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let Some(name_os) = path.file_name() else {
+            continue;
+        };
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
+        selected.push(SelectedTransferFileDto {
+            name: name.to_string(),
+            path: path.display().to_string(),
+            size_bytes: metadata.len(),
+        });
+    }
+
+    Ok(selected)
 }
 
 struct SingleInstanceGuard {
@@ -1671,28 +1734,37 @@ fn create_transfer_plan(
     let outbound_files = request
         .files
         .into_iter()
-        .map(|file| TransferArtifactFile {
-            name: file.name,
-            bytes: file.bytes,
+        .map(|file| {
+            let path = PathBuf::from(&file.path);
+            let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
+            if !metadata.is_file() {
+                return Err(format!("transfer source is not a file: {}", path.display()));
+            }
+            Ok(TransferArtifactFile {
+                name: file.name,
+                source_path: path,
+                size_bytes: metadata.len(),
+            })
         })
-        .collect::<Vec<_>>();
-    let files = outbound_files
+        .collect::<Result<Vec<_>, _>>()?;
+    if outbound_files.is_empty() {
+        return Err("no files selected for transfer".to_string());
+    }
+
+    let transfer_files = outbound_files
         .iter()
         .map(|file| TransferFileDescriptor {
             file_id: Uuid::new_v4(),
             name: file.name.clone(),
-            size_bytes: file.bytes.len() as u64,
+            size_bytes: file.size_bytes,
         })
         .collect();
-    let file_bytes = outbound_files
-        .iter()
-        .map(|file| file.bytes.clone())
-        .collect::<Vec<_>>();
     let plan = approve_transfer(
-        plan_transfer(source_device_id, target_device_id, files, None)
+        plan_transfer(source_device_id, target_device_id, transfer_files, None)
             .map_err(|error| error.to_string())?,
     );
-    let record = execute_remote_transfer(&state.data_paths, &remote, plan, file_bytes).map_err(|error| error.to_string())?;
+    let record = execute_remote_transfer(&state.data_paths, &remote, plan, &outbound_files)
+        .map_err(|error| error.to_string())?;
     persist_outbound_transfer_artifacts(&state.data_paths, &record, &outbound_files)
         .map_err(|error| error.to_string())?;
     state
@@ -1720,7 +1792,7 @@ fn persist_outbound_transfer_artifacts(
 
     for file in files {
         let file_path = transfer_dir.join(&file.name);
-        fs::write(&file_path, &file.bytes)
+        fs::copy(&file.source_path, &file_path)
             .with_context(|| format!("write outbound transfer artifact {}", file_path.display()))?;
     }
 
@@ -1927,7 +1999,7 @@ fn execute_remote_transfer(
     paths: &AppPaths,
     remote: &DeviceDescriptor,
     plan: TransferPlan,
-    file_bytes: Vec<Vec<u8>>,
+    files: &[TransferArtifactFile],
 ) -> Result<TransferRecord> {
     let local_identity = load_or_create_identity(paths, &default_display_name())?;
     let started = std::time::Instant::now();
@@ -1952,20 +2024,10 @@ fn execute_remote_transfer(
         confirmed_at_unix_ms: None,
         error: None,
     };
-    let payload = TransferArtifactPayload {
+    let header = TransferSessionHeader {
         record: record.clone(),
         source_device_id: local_identity.device_id.to_string(),
         source_display_name: local_identity.display_name,
-        files: plan
-            .manifest
-            .files
-            .iter()
-            .zip(file_bytes)
-            .map(|(file, bytes)| TransferArtifactFile {
-                name: file.name.clone(),
-                bytes,
-            })
-            .collect(),
     };
 
     let client_config = std::sync::Arc::new(build_client_tls_config(paths, remote)?);
@@ -1976,11 +2038,72 @@ fn execute_remote_transfer(
     let connection = rustls::ClientConnection::new(client_config, server_name)
         .context("create transfer client tls connection")?;
     let mut tls = rustls::StreamOwned::new(connection, stream);
-    let raw = serde_json::to_vec(&payload).context("serialize transfer payload")?;
-    tls.write_all(&(raw.len() as u64).to_be_bytes())
-        .context("write transfer payload length")?;
-    tls.write_all(&raw).context("write transfer payload body")?;
-    tls.flush().context("flush transfer payload")?;
+    let session_raw = serde_json::to_vec(&header).context("serialize transfer session header")?;
+    tls.write_all(&(session_raw.len() as u64).to_be_bytes())
+        .context("write transfer session header length")?;
+    tls.write_all(&session_raw)
+        .context("write transfer session header payload")?;
+
+    let mut writer = BufWriter::new(tls);
+    for (descriptor, file) in plan.manifest.files.iter().zip(files.iter()) {
+        let mut reader = BufReader::new(
+            fs::File::open(&file.source_path)
+                .with_context(|| format!("open transfer source {}", file.source_path.display()))?,
+        );
+        let chunk_capacity = usize::try_from(plan.chunk_size_bytes)
+            .map_err(|_| anyhow::anyhow!("transfer chunk size exceeds platform capacity"))?;
+        let mut buffer = vec![0u8; chunk_capacity];
+        let mut offset = 0u64;
+        let mut chunk_index = 0u64;
+        loop {
+            let bytes_read = reader
+                .read(&mut buffer)
+                .with_context(|| format!("read transfer source {}", file.source_path.display()))?;
+            if bytes_read == 0 {
+                break;
+            }
+            let chunk_bytes = &buffer[..bytes_read];
+            let is_last_chunk = offset + bytes_read as u64 >= descriptor.size_bytes;
+            let chunk_header = TransferChunkHeader {
+                transfer_id: plan.manifest.transfer_id,
+                file_id: descriptor.file_id,
+                file_name: descriptor.name.clone(),
+                chunk_index,
+                offset,
+                size_bytes: bytes_read as u64,
+                checksum_sha256: checksum_sha256(chunk_bytes),
+                is_last_chunk,
+            };
+            let chunk_header_raw =
+                serde_json::to_vec(&chunk_header).context("serialize transfer chunk header")?;
+            writer
+                .write_all(&(chunk_header_raw.len() as u64).to_be_bytes())
+                .context("write transfer chunk header length")?;
+            writer
+                .write_all(&chunk_header_raw)
+                .context("write transfer chunk header payload")?;
+            writer
+                .write_all(chunk_bytes)
+                .context("write transfer chunk payload")?;
+            record.progress.transferred_bytes = (record.progress.transferred_bytes + bytes_read as u64)
+                .min(plan.manifest.total_bytes);
+            record.progress.chunk_index = chunk_index;
+            record.progress.status = if record.progress.transferred_bytes >= plan.manifest.total_bytes {
+                core_file_transfer::TransferStatus::Completed
+            } else {
+                core_file_transfer::TransferStatus::InProgress
+            };
+            offset += bytes_read as u64;
+            chunk_index += 1;
+        }
+    }
+    writer
+        .write_all(&0u64.to_be_bytes())
+        .context("write transfer end marker")?;
+    writer.flush().context("flush transfer payload")?;
+    let mut tls = writer
+        .into_inner()
+        .map_err(|error| anyhow::anyhow!("extract transfer tls stream: {error}"))?;
     let mut length_bytes = [0u8; 8];
     tls.read_exact(&mut length_bytes).context("read transfer ack length")?;
     let ack_len = u64::from_be_bytes(length_bytes);

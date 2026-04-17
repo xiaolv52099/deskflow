@@ -1,12 +1,20 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Check, Copy, File, FileArchive, FileImage, FileSpreadsheet, FileText, FolderOpen, Paperclip, RefreshCw, Send, Upload } from "lucide-react";
-import { createTransferPlan, getConnectionState, getDeviceManagementSnapshot, getTransferArtifactPath, listTransferPlans, revealTransferArtifactLocation, type ConnectionStateDto, type DeviceManagementSnapshot, type TransferRecord } from "../lib/tauri";
+import {
+  createTransferPlan,
+  getConnectionState,
+  getDeviceManagementSnapshot,
+  getTransferArtifactPath,
+  listTransferPlans,
+  revealTransferArtifactLocation,
+  selectTransferFiles,
+  type ConnectionStateDto,
+  type DeviceManagementSnapshot,
+  type SelectedTransferFileDto,
+  type TransferRecord,
+} from "../lib/tauri";
 
-interface PendingFile {
-  name: string;
-  size_bytes: number;
-  file: File;
-}
+type PendingFile = SelectedTransferFileDto;
 
 interface TransferRow {
   transfer_id: string;
@@ -136,8 +144,6 @@ export function FileTransfer() {
   const [error, setError] = useState("");
   const [isDragging, setIsDragging] = useState(false);
   const [copiedPath, setCopiedPath] = useState<string | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-
   async function refresh() {
     const [nextRecords, nextDevices, nextConnectionState] = await Promise.all([
       listTransferPlans(),
@@ -171,16 +177,21 @@ export function FileTransfer() {
 
   const canSend = connectionState?.active_peer_state === "connected" && Boolean(activePeer);
 
-  function updatePendingFromFileList(list: FileList | null) {
-    if (!list || list.length === 0) return;
-    const next = Array.from(list).map((file) => ({
-      name: file.name,
-      size_bytes: file.size,
-      file,
-    }));
+  function updatePendingFiles(next: PendingFile[]) {
+    if (!next.length) return;
     setPendingFiles(next);
     setStatusText(`已选择 ${next.length} 个文件，总大小 ${formatBytes(next.reduce((sum, file) => sum + file.size_bytes, 0))}`);
     setError("");
+  }
+
+  async function handlePickFiles() {
+    try {
+      setError("");
+      const next = await selectTransferFiles();
+      updatePendingFiles(next);
+    } catch (nextError) {
+      setError(formatError(nextError));
+    }
   }
 
   async function handleSendFiles() {
@@ -195,16 +206,13 @@ export function FileTransfer() {
 
     try {
       setError("");
-      const payload = await Promise.all(
-        pendingFiles.map(async (file) => ({
-          name: file.name,
-          size_bytes: file.size_bytes,
-          bytes: Array.from(new Uint8Array(await file.file.arrayBuffer())),
-        })),
-      );
+      const payload = pendingFiles.map((file) => ({
+        name: file.name,
+        path: file.path,
+        size_bytes: file.size_bytes,
+      }));
       const result = await createTransferPlan(activePeer.device_id, payload);
       setPendingFiles([]);
-      if (fileInputRef.current) fileInputRef.current.value = "";
       setStatusText(result.delivery_message ?? `已向 ${activePeer.display_name} 发送 ${payload.length} 个文件。`);
       await refresh();
     } catch (nextError) {
@@ -275,20 +283,18 @@ export function FileTransfer() {
               onDrop={(event) => {
                 event.preventDefault();
                 setIsDragging(false);
-                updatePendingFromFileList(event.dataTransfer.files);
+                void handlePickFiles();
               }}
             >
               <Upload className="mb-3 text-blue-400" size={24} />
               <div className="text-sm font-medium text-slate-200">拖拽文件到这里</div>
-              <div className="mt-1 text-[11px] text-slate-500">发送端拿到接收端确认后，才会显示“已送达”。</div>
+              <div className="mt-1 text-[11px] text-slate-500">发送端改为 Rust 侧流式分片传输，避免整文件内存拷贝。</div>
             </div>
-
-            <input className="hidden" multiple onChange={(event) => updatePendingFromFileList(event.target.files)} ref={fileInputRef} type="file" />
 
             <div className="mt-3 flex gap-2">
               <button
                 className="flex flex-1 items-center justify-center gap-1.5 rounded-md bg-slate-700 px-3 py-2 text-xs font-medium text-slate-100 transition-colors hover:bg-slate-600"
-                onClick={() => fileInputRef.current?.click()}
+                onClick={() => void handlePickFiles()}
                 type="button"
               >
                 <Paperclip size={14} />

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use core_file_transfer::{TransferPlan, TransferProgress};
+use core_file_transfer::{checksum_sha256, TransferPlan, TransferProgress};
 use core_protocol::{negotiate_protocol, ProtocolFrame, ProtocolMessage, VersionNegotiation};
 use core_session::{
     bind_discovery_socket, build_server_tls_config, manual_endpoint, process_pairing_request,
@@ -16,7 +16,7 @@ use local_ipc::bind_listener;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,6 +52,126 @@ struct TransferRecord {
     error: Option<String>,
 }
 
+fn persist_transfer_stream(
+    paths: &AppPaths,
+    tls: &mut rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>,
+    session: TransferSessionHeader,
+) -> Result<TransferDeliveryAck> {
+    paths.ensure_layout()?;
+    let identity = load_or_create_identity(paths, &default_display_name())?;
+    let transfer_dir = paths
+        .transfers_dir()
+        .join(session.record.plan.manifest.transfer_id.to_string());
+    fs::create_dir_all(&transfer_dir).context("create transfer artifact directory")?;
+
+    let confirmed_at_unix_ms = unix_time_now_ms();
+    let mut record = session.record.clone();
+    record.direction = "inbound".into();
+    record.peer_device_id = Some(session.source_device_id.clone());
+    record.peer_display_name = Some(session.source_display_name.clone());
+    record.delivery_state = "received".into();
+    record.delivery_message = Some("接收端已落盘并校验完成".into());
+    record.confirmed_at_unix_ms = Some(confirmed_at_unix_ms);
+    record.verified_files = 0;
+
+    let mut writers: HashMap<Uuid, BufWriter<fs::File>> = HashMap::new();
+    let mut verified_files = 0usize;
+    let mut transferred_bytes = 0u64;
+
+    loop {
+        let mut chunk_length_bytes = [0u8; 8];
+        tls.read_exact(&mut chunk_length_bytes)
+            .context("read transfer chunk header length")?;
+        let chunk_header_len = u64::from_be_bytes(chunk_length_bytes);
+        if chunk_header_len == 0 {
+            break;
+        }
+
+        let mut chunk_header_raw = vec![0u8; chunk_header_len as usize];
+        tls.read_exact(&mut chunk_header_raw)
+            .context("read transfer chunk header payload")?;
+        let chunk_header: TransferChunkHeader =
+            serde_json::from_slice(&chunk_header_raw).context("parse transfer chunk header")?;
+
+        let expected_file = record
+            .plan
+            .manifest
+            .files
+            .iter()
+            .find(|file| file.file_id == chunk_header.file_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown transfer file {}", chunk_header.file_id))?;
+        if expected_file.name != chunk_header.file_name {
+            anyhow::bail!("transfer file name mismatch for {}", chunk_header.file_id);
+        }
+
+        let mut chunk_bytes = vec![0u8; chunk_header.size_bytes as usize];
+        tls.read_exact(&mut chunk_bytes)
+            .context("read transfer chunk payload")?;
+        let actual_checksum = checksum_sha256(&chunk_bytes);
+        if actual_checksum != chunk_header.checksum_sha256 {
+            anyhow::bail!("transfer chunk checksum mismatch for {}", chunk_header.file_id);
+        }
+
+        let file_path = transfer_dir.join(&chunk_header.file_name);
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("prepare transfer directory {}", parent.display()))?;
+        }
+
+        let writer = if let Some(writer) = writers.get_mut(&chunk_header.file_id) {
+            writer
+        } else {
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&file_path)
+                .with_context(|| format!("open received transfer file {}", file_path.display()))?;
+            writers.insert(chunk_header.file_id, BufWriter::new(file));
+            writers
+                .get_mut(&chunk_header.file_id)
+                .expect("writer must exist after insert")
+        };
+        writer
+            .write_all(&chunk_bytes)
+            .with_context(|| format!("write received transfer file {}", file_path.display()))?;
+        transferred_bytes = (transferred_bytes + chunk_header.size_bytes).min(record.plan.manifest.total_bytes);
+        if chunk_header.is_last_chunk {
+            writer
+                .flush()
+                .with_context(|| format!("flush received transfer file {}", file_path.display()))?;
+            verified_files += 1;
+        }
+    }
+
+    record.verified_files = verified_files;
+    record.progress.transferred_bytes = transferred_bytes;
+    record.progress.total_bytes = record.plan.manifest.total_bytes;
+    record.progress.status = core_file_transfer::TransferStatus::Completed;
+    let summary_path = transfer_dir.join("transfer-record.json");
+    let summary = serde_json::to_string_pretty(&record).context("serialize transfer record")?;
+    fs::write(&summary_path, summary).context("write transfer record summary")?;
+
+    Ok(TransferDeliveryAck {
+        ok: true,
+        receiver_device_id: identity.device_id.to_string(),
+        receiver_display_name: identity.display_name,
+        confirmed_at_unix_ms,
+        verified_files,
+        total_bytes: record.plan.manifest.total_bytes,
+        message: "接收端已落盘并校验完成".into(),
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct TransferSessionHeader {
+    record: TransferRecord,
+    source_device_id: String,
+    source_display_name: String,
+}
+
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct TransferArtifactPayload {
@@ -61,11 +181,25 @@ struct TransferArtifactPayload {
     files: Vec<TransferArtifactFile>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct TransferArtifactFile {
     name: String,
     bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct TransferChunkHeader {
+    transfer_id: uuid::Uuid,
+    file_id: uuid::Uuid,
+    file_name: String,
+    chunk_index: u64,
+    offset: u64,
+    size_bytes: u64,
+    checksum_sha256: String,
+    is_last_chunk: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -449,14 +583,15 @@ fn handle_transfer_connection(
     let mut tls = rustls::StreamOwned::new(connection, stream);
 
     let mut length_bytes = [0u8; 8];
-    tls.read_exact(&mut length_bytes).context("read transfer payload length")?;
+    tls.read_exact(&mut length_bytes).context("read transfer session header length")?;
     let payload_len = u64::from_be_bytes(length_bytes);
     let mut payload = vec![0u8; payload_len as usize];
-    tls.read_exact(&mut payload).context("read transfer payload body")?;
+    tls.read_exact(&mut payload).context("read transfer session header body")?;
 
-    let artifact: TransferArtifactPayload =
-        serde_json::from_slice(&payload).context("parse received transfer payload")?;
-    let ack = persist_transfer_artifacts(paths, &artifact).context("persist received transfer artifacts")?;
+    let session: TransferSessionHeader =
+        serde_json::from_slice(&payload).context("parse received transfer session header")?;
+    let ack = persist_transfer_stream(paths, &mut tls, session)
+        .context("persist received transfer artifacts")?;
     let ack_raw = serde_json::to_vec(&ack).context("serialize transfer ack")?;
     tls.write_all(&(ack_raw.len() as u64).to_be_bytes())
         .context("write transfer ack length")?;
@@ -465,6 +600,7 @@ fn handle_transfer_connection(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn persist_transfer_artifacts(paths: &AppPaths, artifact: &TransferArtifactPayload) -> Result<TransferDeliveryAck> {
     paths.ensure_layout()?;
     let identity = load_or_create_identity(paths, &default_display_name())?;

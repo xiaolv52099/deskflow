@@ -79,8 +79,8 @@
       "title": "文件传输",
       "priority": "P1",
       "module": "file-transfer",
-      "status": "done",
-      "summary": "在新界面中实现文件选择、拖拽、传输记录展示和本地验证产物落盘。",
+      "status": "in_progress",
+      "summary": "正在将文件传输从整包内存 IPC 方案重构为 Rust 端流式分片传输，已完成路径选择与基础收发主干。",
       "tests": [
         {
           "type": "build",
@@ -101,7 +101,10 @@
         }
       ],
       "notes": [
-        "当前为本地链路验证，真实跨设备文件流仍需继续接入 session 层。"
+        "前端已改为原生选择文件路径，不再通过 WebView 将整文件字节数组传入 Tauri IPC。",
+        "Rust 发送端已改为按文件路径流式读取、分片发送。",
+        "core-service 接收端已接入新的 session header 与 chunk header 主干，但仍需继续做双机大文件回归与旧路径清理。",
+        "当前 cargo check 与 npm run build 已通过。"
       ]
     },
     {
