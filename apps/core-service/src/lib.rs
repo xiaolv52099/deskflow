@@ -8,7 +8,8 @@ use core_topology::load_or_create_topology;
 use device_trust::{default_display_name, load_or_create_certificate, load_or_create_identity};
 use foundation::{
     append_log, export_diagnostic_snapshot, init_tracing, load_discovery_peers,
-    load_or_create_config, save_discovery_peers, AppPaths, DiscoveryPeer,
+    load_or_create_config, load_pending_pairing_requests, save_discovery_peers,
+    save_pending_pairing_requests, AppPaths, DiscoveryPeer, PendingPairingRequest,
 };
 use local_ipc::bind_listener;
 use std::collections::HashMap;
@@ -147,26 +148,51 @@ async fn run_discovery_loop(
                     Ok(frame) => frame,
                     Err(_) => continue,
                 };
-                let ProtocolMessage::DiscoverAnnounce(remote) = frame.message else {
-                    continue;
-                };
-                if remote.device_id == device.device_id {
-                    continue;
+                match frame.message {
+                    ProtocolMessage::DiscoverAnnounce(remote) => {
+                        if remote.device_id == device.device_id {
+                            continue;
+                        }
+                        peers.insert(
+                            remote.device_id.clone(),
+                            DiscoveryPeer {
+                                device_id: remote.device_id.clone(),
+                                display_name: remote.display_name.clone(),
+                                platform: remote.platform.clone(),
+                                address: addr.ip().to_string(),
+                                port: remote.port,
+                                fingerprint_sha256: remote.fingerprint_sha256.clone(),
+                                certificate_pem: remote.certificate_pem.clone(),
+                                discovered_at_unix_ms: unix_time_now_ms(),
+                            },
+                        );
+                        save_discovery_peers(&paths, &peers.values().cloned().collect::<Vec<_>>())?;
+                    }
+                    ProtocolMessage::PairRequest { device, pairing_code } => {
+                        if let Ok(config) = load_or_create_config(&paths) {
+                            if config.app_role == "controller" && config.controller_service_enabled {
+                                let mut requests = load_pending_pairing_requests(&paths)
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .filter(|request| request.device_id != device.device_id)
+                                    .collect::<Vec<_>>();
+                                requests.push(PendingPairingRequest {
+                                    device_id: device.device_id,
+                                    display_name: device.display_name,
+                                    platform: device.platform,
+                                    address: addr.ip().to_string(),
+                                    port: device.port,
+                                    fingerprint_sha256: device.fingerprint_sha256,
+                                    certificate_pem: device.certificate_pem,
+                                    pairing_code: pairing_code.value,
+                                    received_at_unix_ms: unix_time_now_ms(),
+                                });
+                                save_pending_pairing_requests(&paths, &requests)?;
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                peers.insert(
-                    remote.device_id.clone(),
-                    DiscoveryPeer {
-                        device_id: remote.device_id.clone(),
-                        display_name: remote.display_name.clone(),
-                        platform: remote.platform.clone(),
-                        address: addr.ip().to_string(),
-                        port: remote.port,
-                        fingerprint_sha256: remote.fingerprint_sha256.clone(),
-                        certificate_pem: remote.certificate_pem.clone(),
-                        discovered_at_unix_ms: unix_time_now_ms(),
-                    },
-                );
-                save_discovery_peers(&paths, &peers.values().cloned().collect::<Vec<_>>())?;
             }
         }
     }

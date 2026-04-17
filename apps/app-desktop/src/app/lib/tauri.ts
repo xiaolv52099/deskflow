@@ -33,7 +33,6 @@ export interface PairingOfferDto {
   endpoint_host: string;
   session_port: number;
   pairing_code: string;
-  payload: string;
 }
 
 export interface DiscoveryPeer {
@@ -123,6 +122,25 @@ export interface PairingConnectResultDto {
   device_management: DeviceManagementSnapshot;
 }
 
+export interface PendingPairingRequestDto {
+  device_id: string;
+  display_name: string;
+  platform: string;
+  address: string;
+  port: number;
+  pairing_code: string;
+  received_at_unix_ms: number;
+}
+
+export interface ConnectionStateDto {
+  app_role: string;
+  controller_service_enabled: boolean;
+  current_pairing_code: string | null;
+  active_peer_device_id: string | null;
+  active_peer_display_name: string | null;
+  pending_pairing_requests: PendingPairingRequestDto[];
+}
+
 export interface LogPreviewDto {
   log_path: string;
   lines: string[];
@@ -178,8 +196,46 @@ export async function trustDiscoveredPeer(device_id: string) {
   });
 }
 
+export async function submitDiscoveryPairingRequest(device_id: string) {
+  return invoke<string>("submit_discovery_pairing_request", {
+    request: { device_id },
+  });
+}
+
+export async function getConnectionState() {
+  return invoke<ConnectionStateDto>("get_connection_state");
+}
+
+export async function setAppRole(role: string) {
+  return invoke<ConnectionStateDto>("set_app_role", {
+    request: { role },
+  });
+}
+
+export async function setControllerServiceEnabled(enabled: boolean) {
+  return invoke<ConnectionStateDto>("set_controller_service_enabled", {
+    enabled,
+  });
+}
+
+export async function respondToPendingPairing(device_id: string, accept: boolean) {
+  return invoke<ConnectionStateDto>("respond_to_pending_pairing", {
+    request: { device_id, accept },
+  });
+}
+
+export async function disconnectActivePeer() {
+  return invoke<ConnectionStateDto>("disconnect_active_peer");
+}
+
 export async function getDeviceManagementSnapshot() {
   return invoke<DeviceManagementSnapshot>("get_device_management_snapshot");
+}
+
+export async function repairManagedDevice(device_id: string, action: "mark_online" | "retry_now" | "revoke") {
+  return invoke<DeviceManagementSnapshot>("repair_managed_device", {
+    request: { device_id, action },
+  });
 }
 
 export async function createTransferPlan(target_device_id: string, files: { name: string; size_bytes: number }[]) {

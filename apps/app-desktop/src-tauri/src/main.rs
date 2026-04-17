@@ -24,8 +24,8 @@ use device_trust::{
 };
 use foundation::{
     append_log, export_extended_diagnostic_snapshot, load_discovery_peers, load_or_create_config,
-    read_recent_log_lines, save_config, AppConfig, AppPaths, DiagnosticMetric, DiscoveryPeer,
-    DATA_ROOT_ENV_VAR,
+    load_pending_pairing_requests, read_recent_log_lines, save_config, save_pending_pairing_requests,
+    AppConfig, AppPaths, DiagnosticMetric, DiscoveryPeer, DATA_ROOT_ENV_VAR,
 };
 use local_ipc::{send_command, CoreToUiEvent, UiToCoreCommand};
 use serde::{Deserialize, Serialize};
@@ -81,6 +81,45 @@ struct AppHealth {
     topology_version: u64,
     clipboard_enabled: bool,
     auto_discovery_enabled: bool,
+    app_role: String,
+    controller_service_enabled: bool,
+    active_peer_device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct ConnectionStateDto {
+    app_role: String,
+    controller_service_enabled: bool,
+    current_pairing_code: Option<String>,
+    active_peer_device_id: Option<String>,
+    active_peer_display_name: Option<String>,
+    pending_pairing_requests: Vec<PendingPairingRequestDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct PendingPairingRequestDto {
+    device_id: String,
+    display_name: String,
+    platform: String,
+    address: String,
+    port: u16,
+    pairing_code: String,
+    received_at_unix_ms: u128,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct SetAppRoleRequest {
+    role: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct ConfirmPendingPairingRequest {
+    device_id: String,
+    accept: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,7 +196,6 @@ struct PairingOfferDto {
     endpoint_host: String,
     session_port: u16,
     pairing_code: String,
-    payload: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -306,6 +344,12 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_app_health,
             get_runtime_overview,
+            get_connection_state,
+            set_app_role,
+            set_controller_service_enabled,
+            submit_discovery_pairing_request,
+            respond_to_pending_pairing,
+            disconnect_active_peer,
             get_topology_snapshot,
             add_pending_topology_device,
             place_topology_device,
@@ -487,6 +531,9 @@ fn initialize_app_state() -> Result<AppState> {
             topology_version: topology.version,
             clipboard_enabled: config.clipboard_enabled,
             auto_discovery_enabled: config.auto_discovery_enabled,
+            app_role: config.app_role.clone(),
+            controller_service_enabled: config.controller_service_enabled,
+            active_peer_device_id: config.active_peer_device_id.clone(),
         }),
         topology: Mutex::new(topology),
         clipboard: Mutex::new({
@@ -650,6 +697,299 @@ fn get_runtime_overview(state: tauri::State<'_, AppState>) -> Result<RuntimeOver
         tray_status,
         boot_error,
     })
+}
+
+#[tauri::command]
+fn get_connection_state(state: tauri::State<'_, AppState>) -> Result<ConnectionStateDto, String> {
+    let config = load_or_create_config(&state.data_paths).map_err(|error| error.to_string())?;
+    {
+        let mut config_slot = state
+            .config
+            .lock()
+            .map_err(|_| "failed to access app config".to_string())?;
+        *config_slot = config.clone();
+    }
+    let trust_store = load_trust_store(&state.data_paths).map_err(|error| error.to_string())?;
+    let managed = managed_devices_from_trust_store(
+        &trust_store,
+        unix_time_now_ms(),
+        DEFAULT_OFFLINE_AFTER_MS,
+    );
+    {
+        let mut managed_slot = state
+            .managed_devices
+            .lock()
+            .map_err(|_| "failed to access managed devices".to_string())?;
+        *managed_slot = managed.clone();
+    }
+    let active_peer_display_name = config.active_peer_device_id.as_ref().and_then(|device_id| {
+        managed
+            .iter()
+            .find(|device| device.device_id.to_string() == *device_id)
+            .map(|device| device.display_name.clone())
+    });
+    let pending = load_pending_pairing_requests(&state.data_paths)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|request| PendingPairingRequestDto {
+            device_id: request.device_id,
+            display_name: request.display_name,
+            platform: request.platform,
+            address: request.address,
+            port: request.port,
+            pairing_code: request.pairing_code,
+            received_at_unix_ms: request.received_at_unix_ms,
+        })
+        .collect();
+
+    Ok(ConnectionStateDto {
+        app_role: config.app_role,
+        controller_service_enabled: config.controller_service_enabled,
+        current_pairing_code: config.current_pairing_code,
+        active_peer_device_id: config.active_peer_device_id,
+        active_peer_display_name,
+        pending_pairing_requests: pending,
+    })
+}
+
+#[tauri::command]
+fn set_app_role(
+    state: tauri::State<'_, AppState>,
+    request: SetAppRoleRequest,
+) -> Result<ConnectionStateDto, String> {
+    let role = request.role.trim().to_lowercase();
+    if role != "controller" && role != "client" {
+        return Err("invalid app role".into());
+    }
+
+    {
+        let health = state
+            .health
+            .lock()
+            .map_err(|_| "failed to access app health".to_string())?;
+        if health.controller_service_enabled && role == "client" {
+            return Err("主控服务启用时不能切换为被控端".into());
+        }
+    }
+
+    {
+        let mut config = state
+            .config
+            .lock()
+            .map_err(|_| "failed to access app config".to_string())?;
+        config.app_role = role.clone();
+        save_config(&state.data_paths, &config).map_err(|error| error.to_string())?;
+    }
+
+    {
+        let mut health = state
+            .health
+            .lock()
+            .map_err(|_| "failed to access app health".to_string())?;
+        health.app_role = role;
+    }
+
+    get_connection_state(state)
+}
+
+#[tauri::command]
+fn set_controller_service_enabled(
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<ConnectionStateDto, String> {
+    {
+        let mut config = state
+            .config
+            .lock()
+            .map_err(|_| "failed to access app config".to_string())?;
+        config.app_role = "controller".into();
+        config.controller_service_enabled = enabled;
+        if enabled {
+            if config.current_pairing_code.is_none() {
+                config.current_pairing_code = Some(generate_pairing_code());
+            }
+        } else {
+            config.current_pairing_code = None;
+            config.active_peer_device_id = None;
+        }
+        if enabled && config.active_peer_device_id.is_none() {
+            let devices = load_trust_store(&state.data_paths).map_err(|error| error.to_string())?;
+            if let Some(device) = devices.devices.into_iter().find(|device| device.revoked_at_unix_ms.is_none()) {
+                config.active_peer_device_id = Some(device.device_id.to_string());
+            }
+        }
+        save_config(&state.data_paths, &config).map_err(|error| error.to_string())?;
+    }
+
+    {
+        let mut health = state
+            .health
+            .lock()
+            .map_err(|_| "failed to access app health".to_string())?;
+        health.app_role = "controller".into();
+        health.controller_service_enabled = enabled;
+        if enabled {
+            if health.active_peer_device_id.is_none() {
+                let devices = load_trust_store(&state.data_paths).map_err(|error| error.to_string())?;
+                if let Some(device) = devices.devices.into_iter().find(|device| device.revoked_at_unix_ms.is_none()) {
+                    health.active_peer_device_id = Some(device.device_id.to_string());
+                }
+            }
+        } else {
+            health.active_peer_device_id = None;
+        }
+    }
+
+    sync_topology_with_trusted_devices(&state)?;
+    get_connection_state(state)
+}
+
+#[tauri::command]
+fn submit_discovery_pairing_request(
+    state: tauri::State<'_, AppState>,
+    request: DiscoveryTrustRequest,
+) -> Result<String, String> {
+    let peer = load_discovery_peers(&state.data_paths)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|peer| peer.device_id == request.device_id)
+        .ok_or_else(|| "?????????????".to_string())?;
+
+    let local_identity = load_or_create_identity(&state.data_paths, &default_display_name())
+        .map_err(|error| error.to_string())?;
+    if peer.device_id == local_identity.device_id.to_string() {
+        return Err("?????????".into());
+    }
+    let local_certificate = load_or_create_certificate(&state.data_paths, &local_identity)
+        .map_err(|error| error.to_string())?;
+    let local_descriptor = session_descriptor(
+        &local_identity,
+        &local_certificate,
+        &manual_endpoint(detect_local_host_ip(), SESSION_PORT),
+    );
+    let pairing_code = generate_pairing_code();
+    let frame = core_protocol::ProtocolFrame::new(core_protocol::ProtocolMessage::PairRequest {
+        device: local_descriptor,
+        pairing_code: PairingCode {
+            value: pairing_code.clone(),
+        },
+    })
+    .encode_json_line()
+    .map_err(|error| error.to_string())?;
+
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|error| error.to_string())?;
+    socket
+        .send_to(&frame, format!("{}:{}", peer.address, DISCOVERY_PORT))
+        .map_err(|error| error.to_string())?;
+
+    Ok(pairing_code)
+}
+
+#[tauri::command]
+fn respond_to_pending_pairing(
+    state: tauri::State<'_, AppState>,
+    request: ConfirmPendingPairingRequest,
+) -> Result<ConnectionStateDto, String> {
+    let controller_config = load_or_create_config(&state.data_paths).map_err(|error| error.to_string())?;
+    if controller_config.app_role != "controller" {
+        return Err("当前设备不是主控端，不能处理配对请求".into());
+    }
+    if !controller_config.controller_service_enabled {
+        return Err("请先启用主控端服务，再处理连接请求".into());
+    }
+
+    let local_identity = load_or_create_identity(&state.data_paths, &default_display_name())
+        .map_err(|error| error.to_string())?;
+    let pending = load_pending_pairing_requests(&state.data_paths).map_err(|error| error.to_string())?;
+    let target = pending
+        .iter()
+        .find(|item| item.device_id == request.device_id)
+        .cloned()
+        .ok_or_else(|| "未找到待确认配对请求".to_string())?;
+
+    if target.device_id == local_identity.device_id.to_string() {
+        return Err("不能和自己设备配对".into());
+    }
+
+    let remaining = pending
+        .into_iter()
+        .filter(|item| item.device_id != request.device_id)
+        .collect::<Vec<_>>();
+    save_pending_pairing_requests(&state.data_paths, &remaining).map_err(|error| error.to_string())?;
+
+    if request.accept {
+        let expected_code = controller_config
+            .current_pairing_code
+            .clone()
+            .ok_or_else(|| "主控端当前没有可用配对码".to_string())?;
+        if target.pairing_code != expected_code {
+            return Err("配对码校验失败，请刷新主控端配对码后重试".into());
+        }
+
+        let pairing_request = PairingRequest {
+            requester: DeviceDescriptor {
+                device_id: target.device_id.clone(),
+                display_name: target.display_name.clone(),
+                platform: target.platform.clone(),
+                address: target.address.clone(),
+                port: target.port,
+                fingerprint_sha256: target.fingerprint_sha256.clone(),
+                certificate_pem: target.certificate_pem.clone(),
+            },
+            pairing_code: PairingCode {
+                value: target.pairing_code.clone(),
+            },
+        };
+        process_pairing_request(&state.data_paths, pairing_request, PairingDecision::Accept)
+            .map_err(|error| error.to_string())?;
+        sync_topology_with_trusted_devices(&state)?;
+
+        {
+            let mut config = state
+                .config
+                .lock()
+                .map_err(|_| "failed to access app config".to_string())?;
+            config.active_peer_device_id = Some(target.device_id.clone());
+            save_config(&state.data_paths, &config).map_err(|error| error.to_string())?;
+        }
+        {
+            let mut health = state
+                .health
+                .lock()
+                .map_err(|_| "failed to access app health".to_string())?;
+            health.active_peer_device_id = Some(target.device_id.clone());
+        }
+    }
+
+    get_device_management_snapshot(state.clone())?;
+    get_connection_state(state)
+}
+
+#[tauri::command]
+fn disconnect_active_peer(state: tauri::State<'_, AppState>) -> Result<ConnectionStateDto, String> {
+    {
+        let mut config = state
+            .config
+            .lock()
+            .map_err(|_| "failed to access app config".to_string())?;
+        config.active_peer_device_id = None;
+        if config.app_role == "controller" {
+            config.controller_service_enabled = false;
+            config.current_pairing_code = None;
+        }
+        save_config(&state.data_paths, &config).map_err(|error| error.to_string())?;
+    }
+    {
+        let mut health = state
+            .health
+            .lock()
+            .map_err(|_| "failed to access app health".to_string())?;
+        health.active_peer_device_id = None;
+        if health.app_role == "controller" {
+            health.controller_service_enabled = false;
+        }
+    }
+    get_connection_state(state)
 }
 
 #[tauri::command]
@@ -869,29 +1209,26 @@ fn simulate_image_clipboard_broadcast(
 fn create_pairing_offer(state: tauri::State<'_, AppState>) -> Result<PairingOfferDto, String> {
     let identity = load_or_create_identity(&state.data_paths, &default_display_name())
         .map_err(|error| error.to_string())?;
-    let certificate = load_or_create_certificate(&state.data_paths, &identity)
-        .map_err(|error| error.to_string())?;
     let endpoint_host = detect_local_host_ip();
-    let descriptor = session_descriptor(
-        &identity,
-        &certificate,
-        &manual_endpoint(endpoint_host.clone(), SESSION_PORT),
-    );
-    let pairing_code = generate_pairing_code();
-    let payload = serde_json::to_string_pretty(&PairingRequest {
-        requester: descriptor,
-        pairing_code: core_protocol::PairingCode {
-            value: pairing_code.clone(),
-        },
-    })
-    .map_err(|error| error.to_string())?;
+    let pairing_code = {
+        let mut config = state
+            .config
+            .lock()
+            .map_err(|_| "failed to access app config".to_string())?;
+        let next = config
+            .current_pairing_code
+            .clone()
+            .unwrap_or_else(generate_pairing_code);
+        config.current_pairing_code = Some(next.clone());
+        save_config(&state.data_paths, &config).map_err(|error| error.to_string())?;
+        next
+    };
 
     Ok(PairingOfferDto {
         display_name: identity.display_name,
         endpoint_host,
         session_port: SESSION_PORT,
         pairing_code,
-        payload,
     })
 }
 
@@ -915,29 +1252,104 @@ fn connect_to_manual_endpoint(
 ) -> Result<PairingConnectResultDto, String> {
     let host = request.host.trim();
     if host.is_empty() {
-        return Err("主控端 IP 不能为空".into());
+        return Err("?????? IP ??".into());
     }
     let pairing_code = request.pairing_code.trim();
     if pairing_code.is_empty() {
-        return Err("配对码不能为空".into());
+        return Err("??????".into());
+    }
+    if is_local_endpoint_host(host) {
+        return Err("??????????".into());
     }
 
-    let payload = serde_json::to_string_pretty(&PairingRequest {
-        requester: build_manual_peer_descriptor(host, request.port, pairing_code),
+    let controller_descriptor = build_manual_peer_descriptor(host, request.port, pairing_code);
+    let discovery_snapshot = load_discovery_peers(&state.data_paths)
+        .map_err(|error| error.to_string())?;
+    let known_controller = discovery_snapshot
+        .iter()
+        .find(|peer| peer.address == host && peer.port == request.port)
+        .cloned();
+
+    let local_identity = load_or_create_identity(&state.data_paths, &default_display_name())
+        .map_err(|error| error.to_string())?;
+    if let Some(peer) = known_controller.as_ref() {
+        if peer.device_id == local_identity.device_id.to_string() {
+            return Err("?????????".into());
+        }
+    }
+    let local_certificate = load_or_create_certificate(&state.data_paths, &local_identity)
+        .map_err(|error| error.to_string())?;
+    let local_descriptor = session_descriptor(
+        &local_identity,
+        &local_certificate,
+        &manual_endpoint(detect_local_host_ip(), SESSION_PORT),
+    );
+    let frame = core_protocol::ProtocolFrame::new(core_protocol::ProtocolMessage::PairRequest {
+        device: local_descriptor,
         pairing_code: PairingCode {
             value: pairing_code.to_string(),
         },
     })
+    .encode_json_line()
     .map_err(|error| error.to_string())?;
-    let device_management = accept_pairing_payload(
-        state,
-        PairingImportRequest {
-            payload: payload.clone(),
-        },
-    )?;
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|error| error.to_string())?;
+    socket
+        .send_to(&frame, format!("{host}:{DISCOVERY_PORT}"))
+        .map_err(|error| error.to_string())?;
+
+    if let Some(peer) = known_controller.as_ref() {
+        let pairing_request = PairingRequest {
+            requester: DeviceDescriptor {
+                device_id: peer.device_id.clone(),
+                display_name: peer.display_name.clone(),
+                platform: peer.platform.clone(),
+                address: peer.address.clone(),
+                port: peer.port,
+                fingerprint_sha256: peer.fingerprint_sha256.clone(),
+                certificate_pem: peer.certificate_pem.clone(),
+            },
+            pairing_code: PairingCode {
+                value: pairing_code.to_string(),
+            },
+        };
+        process_pairing_request(&state.data_paths, pairing_request, PairingDecision::Accept)
+            .map_err(|error| error.to_string())?;
+    }
+
+    {
+        let mut config = state
+            .config
+            .lock()
+            .map_err(|_| "failed to access app config".to_string())?;
+        config.app_role = "client".into();
+        if let Some(peer) = known_controller.as_ref() {
+            config.active_peer_device_id = Some(peer.device_id.clone());
+        }
+        save_config(&state.data_paths, &config).map_err(|error| error.to_string())?;
+    }
+
+    {
+        let mut health = state
+            .health
+            .lock()
+            .map_err(|_| "failed to access app health".to_string())?;
+        health.app_role = "client".into();
+        if let Some(peer) = known_controller.as_ref() {
+            health.active_peer_device_id = Some(peer.device_id.clone());
+        }
+    }
+
+    sync_topology_with_trusted_devices(&state)?;
+    let device_management = get_device_management_snapshot(state.clone())?;
 
     Ok(PairingConnectResultDto {
-        imported_payload: payload,
+        imported_payload: serde_json::to_string_pretty(&PairingRequest {
+            requester: controller_descriptor,
+            pairing_code: PairingCode {
+                value: pairing_code.to_string(),
+            },
+        })
+        .map_err(|error| error.to_string())?,
         pairing_code: pairing_code.to_string(),
         endpoint_host: host.to_string(),
         session_port: request.port,
@@ -1135,13 +1547,35 @@ fn repair_managed_device(
     let action = parse_device_repair_action(&request.action)?;
     if action == DeviceRepairAction::Revoke {
         revoke_trusted_device(&state.data_paths, device_id).map_err(|error| error.to_string())?;
+        remove_device_from_topology(&state, device_id)?;
+        {
+            let mut config = state
+                .config
+                .lock()
+                .map_err(|_| "failed to access app config".to_string())?;
+            if config.active_peer_device_id.as_deref() == Some(&request.device_id) {
+                config.active_peer_device_id = None;
+                save_config(&state.data_paths, &config).map_err(|error| error.to_string())?;
+            }
+        }
+        {
+            let mut health = state
+                .health
+                .lock()
+                .map_err(|_| "failed to access app health".to_string())?;
+            if health.active_peer_device_id.as_deref() == Some(&request.device_id) {
+                health.active_peer_device_id = None;
+            }
+        }
     }
 
     let mut devices = state
         .managed_devices
         .lock()
         .map_err(|_| "failed to access managed devices".to_string())?;
-    if let Some(existing) = devices.iter_mut().find(|device| device.device_id == device_id) {
+    if action == DeviceRepairAction::Revoke {
+        devices.retain(|device| device.device_id != device_id);
+    } else if let Some(existing) = devices.iter_mut().find(|device| device.device_id == device_id) {
         *existing = match action {
             DeviceRepairAction::RetryNow => {
                 schedule_device_reconnect(existing, existing.reconnect_attempt.saturating_add(1))
@@ -1357,6 +1791,17 @@ fn sync_topology_with_trusted_devices(state: &tauri::State<'_, AppState>) -> Res
         .topology
         .lock()
         .map_err(|_| "failed to access topology".to_string())?;
+    let trusted_ids = trust_store
+        .devices
+        .iter()
+        .filter(|device| device.revoked_at_unix_ms.is_none())
+        .map(|device| device.device_id)
+        .collect::<std::collections::HashSet<_>>();
+
+    let controller_device_id = topology.controller_device_id;
+    topology
+        .devices
+        .retain(|device| device.device_id == controller_device_id || trusted_ids.contains(&device.device_id));
 
     for device in trust_store.devices.into_iter().filter(|device| device.revoked_at_unix_ms.is_none()) {
         if topology.devices.iter().any(|entry| entry.device_id == device.device_id) {
@@ -1367,8 +1812,64 @@ fn sync_topology_with_trusted_devices(state: &tauri::State<'_, AppState>) -> Res
             .map_err(|error| error.to_string())?;
     }
 
+    auto_place_pending_topology_devices(&mut topology)?;
     save_topology(&state.data_paths, &topology).map_err(|error| error.to_string())?;
     update_health_version(state, topology.version)
+}
+
+fn auto_place_pending_topology_devices(layout: &mut TopologyLayout) -> Result<(), String> {
+    let pending_ids = layout
+        .devices
+        .iter()
+        .filter(|device| device.position.is_none())
+        .map(|device| device.device_id)
+        .collect::<Vec<_>>();
+
+    for device_id in pending_ids {
+        if layout.device(device_id).and_then(|device| device.position).is_some() {
+            continue;
+        }
+
+        let mut placed = false;
+        for y in 0..layout.grid_height {
+            for x in 0..layout.grid_width {
+                if layout.device_at(GridPosition { x, y }).is_some() {
+                    continue;
+                }
+
+                let mut candidate = layout.clone();
+                if candidate.place_device(device_id, GridPosition { x, y }).is_ok() && candidate.validate().is_ok() {
+                    *layout = candidate;
+                    placed = true;
+                    break;
+                }
+            }
+            if placed {
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn remove_device_from_topology(state: &tauri::State<'_, AppState>, device_id: Uuid) -> Result<(), String> {
+    let mut topology = state
+        .topology
+        .lock()
+        .map_err(|_| "failed to access topology".to_string())?;
+    topology.devices.retain(|device| device.device_id != device_id);
+    save_topology(&state.data_paths, &topology).map_err(|error| error.to_string())?;
+    update_health_version(state, topology.version)
+}
+
+fn is_local_endpoint_host(host: &str) -> bool {
+    let normalized = host.trim().to_ascii_lowercase();
+    if normalized == "127.0.0.1" || normalized == "localhost" || normalized == "::1" {
+        return true;
+    }
+
+    normalized == detect_local_host_ip().to_ascii_lowercase()
 }
 
 fn detect_local_host_ip() -> String {

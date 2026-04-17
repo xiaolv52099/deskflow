@@ -2,21 +2,59 @@
   "project": {
     "name": "Deskflow-Plus",
     "mode": "implementation",
-    "current_phase": "integration"
+    "current_phase": "feature-integration"
   },
   "meta": {
-    "last_updated": "2026-04-17T04:35:00+08:00",
-    "version": 6
+    "last_updated": "2026-04-17T18:20:00+08:00",
+    "version": 8
   },
   "assumptions": [
-    "当前目标平台仅包含 Windows 和 macOS",
-    "产品默认运行在局域网直连场景",
-    "主副屏相对位置通过 3x3 网格拖拽配置",
-    "默认界面语言为中文",
-    "Windows 端负责 Windows 构建验证，macOS 打包和权限验证需要在 Mac 上完成",
-    "当前已完成桌面端集成与本机验证，真实多机联调仍需要两台以上设备继续验证"
+    "当前目标平台仅包含 Windows 和 macOS。",
+    "产品默认运行在局域网直连场景。",
+    "主副屏幕相对位置通过 3x3 网格拖拽配置。",
+    "默认界面语言为中文。",
+    "Windows 与 macOS 打包链路已经具备，可继续围绕功能完善。",
+    "真实双机联调仍需要至少两台设备完成最终验收。"
   ],
   "tasks": [
+    {
+      "id": "P0-010",
+      "title": "连接与配对流程",
+      "priority": "P0",
+      "module": "connection",
+      "status": "done",
+      "summary": "完成自动发现、单向手动配对、主控服务启停、被控断开连接、配对后自动显示拓扑的主流程接入。",
+      "tests": [
+        {
+          "type": "build",
+          "name": "cargo check -p app-desktop -j 1",
+          "status": "passed"
+        },
+        {
+          "type": "build",
+          "name": "npm run build",
+          "status": "passed"
+        },
+        {
+          "type": "unit",
+          "name": "cargo test -p core-session -- --nocapture",
+          "status": "passed"
+        },
+        {
+          "type": "unit",
+          "name": "cargo test -p core-topology -- --nocapture",
+          "status": "passed"
+        }
+      ],
+      "notes": [
+        "自动发现模式下，被控端发现主控端后会弹出确认框；主控端收到请求后也会弹出确认框。",
+        "手动配对改为只需要被控端输入主控端 IP、端口和主控端配对码，不再要求双向输入。",
+        "主控端服务增加启用和停止控制；启用后禁止切换到被控端。",
+        "主控端启用服务后会从已信任设备中恢复活动连接状态。",
+        "被控端增加断开连接按钮。",
+        "配对成功后，主控端拓扑会自动加入新设备，并支持继续拖拽调整位置。"
+      ]
+    },
     {
       "id": "P0-009",
       "title": "拓扑编辑界面",
@@ -32,8 +70,8 @@
         }
       ],
       "notes": [
-        "连接配置页已接入真实设备信息、自动发现、信任配对、手动连接与拓扑拖拽。",
-        "页面中文文案已重写，移除了原有乱码和无效占位内容。"
+        "连接配置页已接入真实设备信息、自动发现、手动配对和 3x3 拓扑拖拽。",
+        "拓扑布局会显示主控端与已配对副控端。"
       ]
     },
     {
@@ -63,9 +101,7 @@
         }
       ],
       "notes": [
-        "文件传输页已支持多文件选择和拖拽。",
-        "创建传输后会生成真实传输记录，并将验证文件写入应用数据目录 transfers/<transfer_id>/。",
-        "当前仍是本机验证链路，真实跨设备网络文件流还需要继续接入 session 传输层。"
+        "当前为本地链路验证，真实跨设备文件流仍需继续接入 session 层。"
       ]
     },
     {
@@ -96,12 +132,11 @@
         {
           "name": "windows cursor sample elapsed",
           "status": "passed",
-          "detail": "35.1µs"
+          "detail": "35.1μs"
         }
       ],
       "notes": [
-        "输入调节参数已持久化到 config.json，应用重启后保留。",
-        "core-input 测试已同步到 3x3 网格拓扑。"
+        "输入调节参数已持久化到 config.json，应用重启后保留。"
       ]
     },
     {
@@ -110,7 +145,7 @@
       "priority": "P1",
       "module": "ui",
       "status": "done",
-      "summary": "完成新界面三大页面与侧边栏中文化。",
+      "summary": "完成主界面、连接页、文件传输页、设置页的默认中文化。",
       "tests": [
         {
           "type": "build",
@@ -119,8 +154,7 @@
         }
       ],
       "notes": [
-        "侧边栏、连接配置、文件传输、系统设置页面的主文案均已切换为中文。",
-        "仍有少量 Rust 侧旧中文错误文案未完全统一，但不影响主界面展示。"
+        "本次连接页文案也已经统一为中文。"
       ]
     },
     {
@@ -138,8 +172,7 @@
         }
       ],
       "notes": [
-        "设置页已支持日志预览和诊断快照导出。",
-        "配置结构已扩展输入调节字段，并保持向后兼容。"
+        "设置页支持日志预览和诊断快照导出。"
       ]
     }
   ],
@@ -148,13 +181,16 @@
     "rust_check": "passed",
     "targeted_tests": [
       "foundation",
+      "core-session",
+      "core-topology",
       "core-file-transfer",
       "core-input"
     ]
   },
   "remaining_risks": [
-    "真实跨设备文件传输数据面尚未接入 session 层网络传输",
-    "macOS 运行时权限、输入注入和打包验证仍需在 Mac 上完成",
-    "多机真实局域网回归和安装升级卸载验证尚未完成"
+    "自动发现与手动配对的真实双机确认流程仍需在两台设备上完成端到端回归。",
+    "当前自动恢复连接状态以信任与活动设备状态恢复为主，尚未实现完整会话级重连握手。",
+    "真实跨设备文件传输数据面尚未接入 session 层网络传输。",
+    "macOS 运行权限、输入注入和最终打包验签仍需在 Mac 上继续完成实机验证。"
   ]
 }

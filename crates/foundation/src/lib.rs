@@ -16,6 +16,7 @@ pub const DEVICE_CERTIFICATE_FILE_NAME: &str = "device-certificate.json";
 pub const TRUST_STORE_FILE_NAME: &str = "trust-store.json";
 pub const TOPOLOGY_FILE_NAME: &str = "topology.json";
 pub const DISCOVERY_FILE_NAME: &str = "discovery.json";
+pub const PAIRING_REQUESTS_FILE_NAME: &str = "pairing-requests.json";
 pub const TRANSFERS_DIR_NAME: &str = "transfers";
 pub const DATA_ROOT_ENV_VAR: &str = "DESKFLOW_PLUS_DATA_ROOT";
 
@@ -43,6 +44,14 @@ pub struct AppConfig {
     pub clipboard_enabled: bool,
     #[serde(default)]
     pub input_tuning: InputTuningConfig,
+    #[serde(default = "default_app_role")]
+    pub app_role: String,
+    #[serde(default)]
+    pub controller_service_enabled: bool,
+    #[serde(default)]
+    pub current_pairing_code: Option<String>,
+    #[serde(default)]
+    pub active_peer_device_id: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -52,8 +61,16 @@ impl Default for AppConfig {
             auto_discovery_enabled: true,
             clipboard_enabled: true,
             input_tuning: InputTuningConfig::default(),
+            app_role: default_app_role(),
+            controller_service_enabled: false,
+            current_pairing_code: None,
+            active_peer_device_id: None,
         }
     }
+}
+
+fn default_app_role() -> String {
+    "controller".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,6 +92,19 @@ pub struct DiscoveryPeer {
     pub fingerprint_sha256: String,
     pub certificate_pem: String,
     pub discovered_at_unix_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingPairingRequest {
+    pub device_id: String,
+    pub display_name: String,
+    pub platform: String,
+    pub address: String,
+    pub port: u16,
+    pub fingerprint_sha256: String,
+    pub certificate_pem: String,
+    pub pairing_code: String,
+    pub received_at_unix_ms: u128,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -186,6 +216,10 @@ impl AppPaths {
         self.discovery_dir().join(DISCOVERY_FILE_NAME)
     }
 
+    pub fn pairing_requests_file(&self) -> PathBuf {
+        self.discovery_dir().join(PAIRING_REQUESTS_FILE_NAME)
+    }
+
     pub fn ensure_layout(&self) -> Result<()> {
         fs::create_dir_all(self.config_dir()).context("create config directory")?;
         fs::create_dir_all(self.logs_dir()).context("create logs directory")?;
@@ -286,6 +320,27 @@ pub fn save_discovery_peers(paths: &AppPaths, peers: &[DiscoveryPeer]) -> Result
     paths.ensure_layout()?;
     let raw = serde_json::to_string_pretty(peers).context("serialize discovery snapshot")?;
     fs::write(paths.discovery_file(), raw).context("write discovery snapshot")?;
+    Ok(())
+}
+
+pub fn load_pending_pairing_requests(paths: &AppPaths) -> Result<Vec<PendingPairingRequest>> {
+    paths.ensure_layout()?;
+    let path = paths.pairing_requests_file();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let raw = fs::read_to_string(&path).context("read pending pairing requests")?;
+    serde_json::from_str(&raw).context("parse pending pairing requests")
+}
+
+pub fn save_pending_pairing_requests(
+    paths: &AppPaths,
+    requests: &[PendingPairingRequest],
+) -> Result<()> {
+    paths.ensure_layout()?;
+    let raw = serde_json::to_string_pretty(requests).context("serialize pending pairing requests")?;
+    fs::write(paths.pairing_requests_file(), raw).context("write pending pairing requests")?;
     Ok(())
 }
 
